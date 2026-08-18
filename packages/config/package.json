@@ -1,0 +1,19 @@
+{
+  "name": "@nexa/config",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Centralized, fail-fast environment validation for Node.js runtimes (NestJS API, Next.js web). Never silently starts with missing critical config.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

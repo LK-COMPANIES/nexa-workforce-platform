@@ -1,0 +1,20 @@
+{
+  "name": "@nexa/validation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Shared zod input schemas for core domain entities, used by both NestJS request DTOs and (in the future) client-side form validation.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@nexa/types": "*",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,0 +1,116 @@
+name: nexa-workforce-platform
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "${POSTGRES_EXPOSED_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server --appendonly yes ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    ports:
+      - "${REDIS_EXPOSED_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # NestJS transactional API. NOTE: on a first-ever `docker compose up`, this
+  # service will fail to connect until the `nexa_app` database role exists —
+  # see the bootstrap sequence in docs/architecture.md
+  # (db:migrate → db:rls → db:seed must run once against postgres before
+  # api/ai can authenticate as nexa_app).
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/api.Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      DIRECT_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
+      AI_SERVICE_URL: http://ai:${AI_PORT:-8000}
+    ports:
+      - "${API_PORT:-4000}:4000"
+    volumes:
+      - .:/workspace
+      - api_node_modules:/workspace/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "require('http').get('http://localhost:4000/health', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  ai:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/ai.Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+    ports:
+      - "${AI_PORT:-8000}:8000"
+    volumes:
+      - ./apps/ai:/workspace/apps/ai
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  web:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/web.Dockerfile
+    env_file: .env
+    environment:
+      # Browser-facing (inlined into the client bundle): must be reachable
+      # from the host, not the docker network.
+      NEXT_PUBLIC_API_URL: http://localhost:${API_PORT:-4000}
+      # Server-only: how the web container itself reaches the API.
+      API_INTERNAL_URL: http://api:${API_PORT:-4000}
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    volumes:
+      - .:/workspace
+      - web_node_modules:/workspace/node_modules
+      - web_next_cache:/workspace/apps/web/.next
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  api_node_modules:
+  web_node_modules:
+  web_next_cache:

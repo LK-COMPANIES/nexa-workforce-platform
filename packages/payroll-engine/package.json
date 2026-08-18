@@ -1,0 +1,23 @@
+{
+  "name": "@nexa/payroll-engine",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Pure, framework-free statutory payroll calculation engine. Its only runtime dependency is decimal.js — no NestJS, Prisma, HTTP, Redis, JWT, database connection, environment variable, or external API. Callable from NestJS, background jobs, CLI tools, or automated tests alike.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "test": "jest",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "decimal.js": "^10.4.3"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.13",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.6.0"
+  }
+}

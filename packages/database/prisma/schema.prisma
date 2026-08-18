@@ -1,0 +1,831 @@
+// Nexa Workforce Solutions — Multi-Tenant Data Foundation
+//
+// Tenant isolation model:
+//   Every tenant-scoped table carries an explicit `organization_id` column.
+//   Postgres Row-Level Security (packages/database/prisma/rls/*.sql) enforces
+//   isolation at the database layer using `current_setting('app.current_tenant_id')`.
+//   Application code must never rely on `organizationId` filtering alone —
+//   see packages/database/src/tenant-context.ts for how tenant context is
+//   established before any tenant-scoped query runs.
+//
+// Column naming: all multi-word fields are explicitly @map'd to snake_case so
+// that hand-written SQL (RLS policies, the auth bootstrap function) can
+// reference stable, predictable column names without identifier quoting.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Organization — tenant and organizational-hierarchy foundation
+// ---------------------------------------------------------------------------
+
+enum OrganizationType {
+  NEXA_HOLDING          // The Nexa Workforce Solutions Ltd root entity
+  SUBSIDIARY            // A Nexa-controlled subsidiary
+  CLIENT                // An independent client organization (tenant)
+  CLIENT_BUSINESS_UNIT  // A business unit within a client organization
+  OPERATIONAL_ENTITY    // An operational entity (e.g. a BPO site/campaign)
+}
+
+model Organization {
+  id                String           @id @default(uuid()) @db.Uuid
+  type              OrganizationType
+  legalName         String           @map("legal_name")
+  displayName       String           @map("display_name")
+  taxIdentifier     String?          @map("tax_identifier") // e.g. KRA PIN — jurisdiction-specific, kept opaque here
+  countryCode       String           @default("KE") @map("country_code") @db.Char(2)
+  isActive          Boolean          @default(true) @map("is_active")
+  settings          Json?            @db.JsonB
+
+  parentOrganizationId String?       @map("parent_organization_id") @db.Uuid
+  parent                Organization?  @relation("OrganizationHierarchy", fields: [parentOrganizationId], references: [id], onDelete: Restrict)
+  children              Organization[] @relation("OrganizationHierarchy")
+
+  memberships       OrganizationMembership[]
+  employees         Employee[]
+  contracts         Contract[]
+  payrollRuns       PayrollRun[]
+  payrollRecords    PayrollRecord[]
+  aiAuditLogs       AIAuditLog[]
+  sessions          Session[]
+  authEvents        AuthenticationAuditEvent[]
+  complianceEvaluations ComplianceEvaluation[]
+
+  createdAt         DateTime         @default(now()) @map("created_at")
+  updatedAt         DateTime         @updatedAt @map("updated_at")
+
+  @@index([parentOrganizationId])
+  @@index([type])
+  @@index([countryCode])
+  @@map("organizations")
+}
+
+// ---------------------------------------------------------------------------
+// Identity, RBAC — User / Role / Permission / OrganizationMembership
+// ---------------------------------------------------------------------------
+
+model User {
+  id                    String   @id @default(uuid()) @db.Uuid
+  email                 String   @unique
+  passwordHash          String   @map("password_hash")
+  firstName             String   @map("first_name")
+  lastName              String   @map("last_name")
+  phone                 String?
+  isActive              Boolean  @default(true) @map("is_active")
+
+  // Platform-level super-admin escape hatch. Deliberately NOT modeled as an
+  // OrganizationMembership role: RLS binds a session to a single tenant, so
+  // cross-tenant access is a distinct, explicitly-audited code path (see
+  // docs/tenant-isolation.md) rather than "just another role".
+  isPlatformSuperAdmin  Boolean  @default(false) @map("is_platform_super_admin")
+
+  lastLoginAt           DateTime? @map("last_login_at")
+
+  memberships           OrganizationMembership[]
+  employeeRecord         Employee?
+  createdPayrollRuns     PayrollRun[]              @relation("PayrollRunCreatedBy")
+  approvedPayrollRuns    PayrollRun[]              @relation("PayrollRunApprovedBy")
+  requestedAiAuditLogs   AIAuditLog[]              @relation("AIAuditRequestingUser")
+  reviewedAiAuditLogs    AIAuditLog[]              @relation("AIAuditReviewer")
+  sessions               Session[]
+  authEvents             AuthenticationAuditEvent[]
+  complianceReviews      ComplianceEvaluation[]     @relation("ComplianceReviewer")
+
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @updatedAt @map("updated_at")
+
+  @@index([email])
+  @@map("users")
+}
+
+model Role {
+  id            String   @id @default(uuid()) @db.Uuid
+  key           String   @unique // e.g. "nexa_super_admin", "client_admin"
+  name          String
+  description   String?
+  isSystemRole  Boolean  @default(true) @map("is_system_role") // system roles ship with Phase 1; custom roles can be added later without schema changes
+
+  permissions        RolePermission[]
+  memberships        OrganizationMembership[]
+
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@map("roles")
+}
+
+model Permission {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique // e.g. "employee:read", "payroll:approve"
+  description String?
+
+  roles       RolePermission[]
+
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@map("permissions")
+}
+
+model RolePermission {
+  roleId       String     @map("role_id") @db.Uuid
+  permissionId String     @map("permission_id") @db.Uuid
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+enum MembershipStatus {
+  INVITED
+  ACTIVE
+  SUSPENDED
+  REVOKED
+}
+
+// Scopes a User's Role to a specific Organization (tenant). A user may hold
+// different roles in different organizations (e.g. a Nexa consultant who is
+// HR_Manager on one client engagement and BPO_Supervisor on another).
+model OrganizationMembership {
+  id             String            @id @default(uuid()) @db.Uuid
+  userId         String            @map("user_id") @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  roleId         String            @map("role_id") @db.Uuid
+  status         MembershipStatus  @default(INVITED)
+  invitedAt      DateTime?         @map("invited_at")
+  joinedAt       DateTime?         @map("joined_at")
+
+  user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  role           Role              @relation(fields: [roleId], references: [id], onDelete: Restrict)
+
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+
+  @@unique([userId, organizationId])
+  @@index([organizationId])
+  @@index([userId])
+  @@index([organizationId, status])
+  @@map("organization_memberships")
+}
+
+// ---------------------------------------------------------------------------
+// Sessions, refresh tokens, authentication audit — Phase 2
+// ---------------------------------------------------------------------------
+
+enum SessionStatus {
+  ACTIVE
+  REVOKED
+  EXPIRED
+}
+
+// A logical login instance, scoped to exactly one (user, organization) pair.
+// Switching organizations means logging in again (a new Session), not
+// mutating an existing one — this keeps RLS scoping and the audit trail
+// unambiguous. Every access/refresh token pair traces back to exactly one
+// Session; revoking a Session is how logout and admin-initiated revocation
+// invalidate everything derived from it.
+model Session {
+  id                  String        @id @default(uuid()) @db.Uuid
+  userId              String        @map("user_id") @db.Uuid
+  organizationId      String        @map("organization_id") @db.Uuid
+  status              SessionStatus @default(ACTIVE)
+
+  // True only for a platform-super-admin operating an organization they hold
+  // no OrganizationMembership in. Recorded explicitly so every such session
+  // is unambiguously identifiable in the audit trail — see
+  // AuthenticationAuditEvent's SUPER_ADMIN_ORG_ACCESS event type.
+  isSuperAdminSession Boolean       @default(false) @map("is_super_admin_session")
+
+  ipAddress           String?       @map("ip_address") @db.Inet
+  userAgent           String?       @map("user_agent")
+
+  expiresAt           DateTime      @map("expires_at")
+  lastUsedAt          DateTime      @default(now()) @map("last_used_at")
+  revokedAt           DateTime?     @map("revoked_at")
+  revokedReason        String?      @map("revoked_reason")
+
+  user                User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  organization        Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  refreshTokens        RefreshToken[]
+  authEvents            AuthenticationAuditEvent[]
+
+  createdAt            DateTime     @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@map("sessions")
+}
+
+enum RefreshTokenStatus {
+  ACTIVE
+  ROTATED
+  REVOKED
+  REUSE_DETECTED
+}
+
+// The raw refresh token is never stored — only tokenHash (SHA-256 of a
+// 256-bit crypto-random value). A fast hash is correct here (unlike
+// passwords): the token itself carries enough entropy that an offline
+// brute-force of the hash is infeasible regardless of hash speed, so
+// Argon2id would only add latency with no security benefit. Argon2id is
+// reserved for passwords — see packages/auth/src/password.ts.
+//
+// `familyId` is the rotation-lineage key: every token minted by rotating
+// out of the same original login shares one familyId. Reuse of a token
+// already marked ROTATED or REVOKED is treated as theft — the entire
+// family (and its Session) is revoked. See refresh-token.service.ts.
+model RefreshToken {
+  id             String             @id @default(uuid()) @db.Uuid
+  sessionId      String             @map("session_id") @db.Uuid
+  familyId       String             @map("family_id") @db.Uuid
+  tokenHash      String             @unique @map("token_hash")
+  status         RefreshTokenStatus @default(ACTIVE)
+
+  expiresAt      DateTime           @map("expires_at")
+  rotatedAt      DateTime?          @map("rotated_at")
+  revokedAt      DateTime?          @map("revoked_at")
+  revokedReason  String?            @map("revoked_reason")
+
+  session        Session            @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  createdAt      DateTime           @default(now()) @map("created_at")
+
+  @@index([sessionId])
+  @@index([familyId])
+  @@index([status])
+  @@map("refresh_tokens")
+}
+
+enum AuthEventType {
+  LOGIN_SUCCESS
+  LOGIN_FAILURE
+  LOGOUT
+  REFRESH
+  REFRESH_REUSE_DETECTED
+  SESSION_REVOKED
+  PASSWORD_CHANGED
+  REGISTRATION
+  ACCOUNT_DISABLED
+  UNAUTHORIZED_ACCESS_ATTEMPT
+  TENANT_ACCESS_DENIED
+  // A platform-super-admin established context in an organization they hold
+  // no membership in. Always paired with Session.isSuperAdminSession = true.
+  SUPER_ADMIN_ORG_ACCESS
+}
+
+// Security-investigation trail for the authentication/authorization
+// lifecycle. `organizationId` is always the org the event concerns (even on
+// failure — login attempts always carry a claimed organizationId, so there
+// is no "unscoped" event requiring an RLS bootstrap exception here).
+// NEVER store passwords, raw tokens, or full authentication headers —
+// `metadata` is for small structured context only (e.g. {"reason":
+// "invalid_password"}).
+model AuthenticationAuditEvent {
+  id             String        @id @default(uuid()) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  actingUserId   String?       @map("acting_user_id") @db.Uuid
+  sessionId      String?       @map("session_id") @db.Uuid
+  eventType      AuthEventType @map("event_type")
+
+  ipAddress      String?       @map("ip_address") @db.Inet
+  userAgent      String?       @map("user_agent")
+  metadata       Json?         @db.JsonB
+
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  actingUser     User?         @relation(fields: [actingUserId], references: [id], onDelete: SetNull)
+  session        Session?      @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([organizationId, createdAt])
+  @@index([actingUserId])
+  @@index([eventType])
+  @@map("authentication_audit_events")
+}
+
+// ---------------------------------------------------------------------------
+// Employee domain
+// ---------------------------------------------------------------------------
+
+enum EmploymentIdentityStatus {
+  ACTIVE
+  ON_LEAVE
+  SUSPENDED
+  TERMINATED
+}
+
+// Employment record. Deliberately independent of User: an employee may exist
+// purely as a workforce/payroll record (e.g. outsourced BPO staff who never
+// log into the platform). `userId` links to a login only when one exists —
+// employment identity fields are NOT duplicated from User when a link exists;
+// downstream reads should prefer employee.user.{firstName,lastName,email}
+// when userId is set, falling back to the employee's own fields otherwise.
+model Employee {
+  id               String                   @id @default(uuid()) @db.Uuid
+  organizationId   String                   @map("organization_id") @db.Uuid
+  userId           String?                  @unique @map("user_id") @db.Uuid
+
+  employeeNumber   String                   @map("employee_number")
+  firstName        String                   @map("first_name")
+  lastName         String                   @map("last_name")
+  workEmail        String?                  @map("work_email")
+  phone            String?
+  nationalIdNumber String?                  @map("national_id_number") // e.g. Kenyan National ID — stored opaquely, no format assumptions baked in
+  dateOfBirth      DateTime?                @map("date_of_birth") @db.Date
+  hireDate         DateTime                 @map("hire_date") @db.Date
+  status           EmploymentIdentityStatus @default(ACTIVE)
+
+  organization     Organization             @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  user             User?                    @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  contracts        Contract[]
+  payrollRecords   PayrollRecord[]
+  complianceEvaluations ComplianceEvaluation[]
+
+  createdAt        DateTime                 @default(now()) @map("created_at")
+  updatedAt        DateTime                 @updatedAt @map("updated_at")
+
+  @@unique([organizationId, employeeNumber])
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@map("employees")
+}
+
+// ---------------------------------------------------------------------------
+// Contracts
+// ---------------------------------------------------------------------------
+
+enum ContractType {
+  PERMANENT_EMPLOYMENT
+  FIXED_TERM_EMPLOYMENT
+  CASUAL
+  TEMPORARY_STAFFING
+  OUTSOURCED_WORKFORCE
+  CONSULTING_ENGAGEMENT
+  CLIENT_SERVICES_AGREEMENT
+  INTERNSHIP
+}
+
+enum ContractStatus {
+  DRAFT
+  PENDING_APPROVAL
+  ACTIVE
+  SUSPENDED
+  TERMINATED
+  EXPIRED
+}
+
+enum PaymentInterval {
+  HOURLY
+  DAILY
+  WEEKLY
+  MONTHLY
+}
+
+model Contract {
+  id               String         @id @default(uuid()) @db.Uuid
+  organizationId   String         @map("organization_id") @db.Uuid
+  employeeId       String?        @map("employee_id") @db.Uuid // nullable: a CLIENT_SERVICES_AGREEMENT may not bind to a single employee
+
+  contractType     ContractType   @map("contract_type")
+  status           ContractStatus @default(DRAFT)
+  title            String
+  referenceCode    String?        @map("reference_code")
+
+  effectiveDate    DateTime       @map("effective_date") @db.Date
+  expirationDate   DateTime?      @map("expiration_date") @db.Date
+
+  baseCompensation Decimal?       @map("base_compensation") @db.Decimal(14, 2)
+  currency         String?        @db.Char(3) // ISO 4217, e.g. "KES"
+  paymentInterval  PaymentInterval? @map("payment_interval")
+
+  // Extracted (not buried in `terms`) because the compliance validator
+  // queries these directly — see apps/api/src/contracts/compliance.
+  jobTitle             String?        @map("job_title")
+  jobDescription        String?       @map("job_description")
+  workLocation           String?      @map("work_location")
+  workingHoursPerWeek     Decimal?    @map("working_hours_per_week") @db.Decimal(5, 2)
+  probationMonths           Int?      @map("probation_months")
+  probationExtendedMonths    Int?     @map("probation_extended_months")
+  probationExtensionConsent   Boolean? @map("probation_extension_consent")
+  noticePeriodDays              Int?  @map("notice_period_days")
+  continuousEmploymentDate        DateTime? @map("continuous_employment_date") @db.Date
+
+  // The full ContractDocumentModel (benefits, leave, sick leave, pension,
+  // disciplinary framework, grievance process, termination provisions,
+  // confidentiality, data protection, health & safety, etc.) — see
+  // packages/validation/src/contract-terms.ts for the validated shape. Kept
+  // as structured JSON rather than dozens of rigid columns because its
+  // required shape genuinely varies by contractType, and it is explicitly
+  // meant to feed a future document-rendering layer (brief §31), not be
+  // queried column-by-column.
+  terms                Json?        @map("terms") @db.JsonB
+
+  documentStorageKey String?      @map("document_storage_key") // pointer into object storage — no document content in the DB
+
+  organization     Organization   @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  employee         Employee?      @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  payrollRecords   PayrollRecord[]
+  complianceEvaluations ComplianceEvaluation[]
+
+  createdAt        DateTime       @default(now()) @map("created_at")
+  updatedAt        DateTime       @updatedAt @map("updated_at")
+
+  @@index([organizationId])
+  @@index([employeeId])
+  @@index([organizationId, status])
+  @@index([organizationId, expirationDate])
+  @@map("contracts")
+}
+
+// ---------------------------------------------------------------------------
+// Statutory rules — versioned, jurisdiction-scoped extension point for payroll
+// ---------------------------------------------------------------------------
+
+model StatutoryJurisdiction {
+  id            String                 @id @default(uuid()) @db.Uuid
+  countryCode   String                 @unique @map("country_code") @db.Char(2) // ISO 3166-1 alpha-2, e.g. "KE"
+  name          String
+
+  ruleVersions            StatutoryRuleVersion[]
+  complianceRuleVersions  ComplianceRuleVersion[]
+
+  createdAt     DateTime               @default(now()) @map("created_at")
+  updatedAt     DateTime               @updatedAt @map("updated_at")
+
+  @@map("statutory_jurisdictions")
+}
+
+enum StatutoryRuleType {
+  PAYE
+  NSSF
+  SHIF
+  HOUSING_LEVY
+}
+
+// A single version of ONE statutory instrument's rules (PAYE, NSSF, SHIF, or
+// Housing Levy), effective over a date range. Each instrument versions
+// independently (`ruleType`) because they change on different, unrelated
+// schedules — e.g. NSSF's tiers stepped up in February 2026 while PAYE's
+// bands did not move. `ruleDefinition` holds the actual rates/bands/
+// thresholds as data (see packages/validation for the per-ruleType shape),
+// NOT as constants baked into this Prisma schema — statutory values change
+// and must never require a schema migration to update.
+model StatutoryRuleVersion {
+  id               String                @id @default(uuid()) @db.Uuid
+  jurisdictionId   String                @map("jurisdiction_id") @db.Uuid
+  ruleType         StatutoryRuleType     @map("rule_type")
+  taxYear          Int                   @map("tax_year")
+  effectiveFrom    DateTime              @map("effective_from") @db.Date
+  effectiveTo      DateTime?             @map("effective_to") @db.Date
+  isActive         Boolean               @default(false) @map("is_active")
+  ruleDefinition   Json                  @map("rule_definition") @db.JsonB
+  sourceReference  String?               @map("source_reference") // citation(s) of the authoritative source(s) this version was derived from
+
+  jurisdiction     StatutoryJurisdiction @relation(fields: [jurisdictionId], references: [id], onDelete: Restrict)
+  payrollRunStatutoryRules PayrollRunStatutoryRule[]
+
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime              @updatedAt @map("updated_at")
+
+  @@unique([jurisdictionId, ruleType, effectiveFrom])
+  @@index([jurisdictionId, ruleType, isActive])
+  @@map("statutory_rule_versions")
+}
+
+// ---------------------------------------------------------------------------
+// Compliance — Phase 3
+// ---------------------------------------------------------------------------
+
+enum ComplianceRuleType {
+  PROBATION_MAXIMUM_DURATION
+  WRITTEN_CONTRACT_REQUIRED
+  NOTICE_PERIOD_MINIMUM
+  CASUAL_CONVERSION_THRESHOLD
+  EMPLOYMENT_PARTICULARS_REQUIRED
+}
+
+// A versioned legal rule (e.g. "probation may not exceed 6 months, or 12
+// with written consent to extend" — Employment Act 2007 s.42(2)). Modeled
+// exactly like StatutoryRuleVersion: the compliance engine consumes these as
+// DATA, never as constants in code, so a future legislative change is a
+// seeded row + migration, not a code change. `legalReference` is the
+// specific statutory citation; `sourceReference` documents what was
+// actually checked when this row was authored (see seed.ts) — required, not
+// optional, because compliance rules without a checkable source are not
+// acceptable in this system (brief §41).
+model ComplianceRuleVersion {
+  id               String              @id @default(uuid()) @db.Uuid
+  jurisdictionId   String              @map("jurisdiction_id") @db.Uuid
+  ruleType         ComplianceRuleType  @map("rule_type")
+  effectiveFrom    DateTime            @map("effective_from") @db.Date
+  effectiveTo      DateTime?           @map("effective_to") @db.Date
+  isActive         Boolean             @default(false) @map("is_active")
+  ruleDefinition   Json                @map("rule_definition") @db.JsonB
+  legalReference   String              @map("legal_reference")
+  sourceReference  String              @map("source_reference")
+
+  jurisdiction     StatutoryJurisdiction @relation(fields: [jurisdictionId], references: [id], onDelete: Restrict)
+
+  createdAt        DateTime            @default(now()) @map("created_at")
+  updatedAt        DateTime            @updatedAt @map("updated_at")
+
+  @@unique([jurisdictionId, ruleType, effectiveFrom])
+  @@index([jurisdictionId, ruleType, isActive])
+  @@map("compliance_rule_versions")
+}
+
+enum ComplianceSubjectType {
+  CONTRACT
+  PAYROLL_RUN
+  EMPLOYEE
+}
+
+enum ComplianceStatus {
+  PASS
+  WARNING
+  FAIL
+  REQUIRES_HUMAN_REVIEW
+}
+
+// Append-only audit trail (brief §34: "compliance history is evidence" —
+// never overwritten, only ever created). One row per evaluation run of the
+// deterministic compliance engine against a contract, payroll run, or
+// employee record.
+model ComplianceEvaluation {
+  id                 String                @id @default(uuid()) @db.Uuid
+  organizationId     String                @map("organization_id") @db.Uuid
+  subjectType        ComplianceSubjectType @map("subject_type")
+  contractId         String?               @map("contract_id") @db.Uuid
+  payrollRunId       String?               @map("payroll_run_id") @db.Uuid
+  employeeId         String?               @map("employee_id") @db.Uuid
+
+  status             ComplianceStatus      @default(REQUIRES_HUMAN_REVIEW)
+  score              Decimal?              @db.Decimal(5, 2)
+  findings           Json                  @db.JsonB
+  ruleEngineVersion  String                @map("rule_engine_version")
+
+  reviewedByUserId   String?               @map("reviewed_by_user_id") @db.Uuid
+  reviewedAt         DateTime?             @map("reviewed_at")
+  reviewNotes        String?               @map("review_notes")
+
+  organization       Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  contract           Contract?             @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  payrollRun         PayrollRun?           @relation(fields: [payrollRunId], references: [id], onDelete: SetNull)
+  employee           Employee?             @relation(fields: [employeeId], references: [id], onDelete: SetNull)
+  reviewedBy         User?                 @relation("ComplianceReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt          DateTime              @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([organizationId, createdAt])
+  @@index([contractId])
+  @@index([payrollRunId])
+  @@index([employeeId])
+  @@map("compliance_evaluations")
+}
+
+// Reference data for Nexa's service engagement models — attached to future
+// client-facing Contract/CRM workflows, not hard-coded application logic.
+// Seeded idempotently; see packages/database/prisma/seed.ts.
+model EngagementType {
+  id          String   @id @default(uuid()) @db.Uuid
+  key         String   @unique
+  name        String
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  @@map("engagement_types")
+}
+
+// ---------------------------------------------------------------------------
+// Payroll — Phase 3
+//
+// Phase 1 gave PayrollRecord a single `statutoryRuleVersionId` and its own
+// status/approval fields. That doesn't fit reality: one calculation
+// genuinely depends on FOUR independently-versioned rule types (PAYE, NSSF,
+// SHIF, Housing Levy — see StatutoryRuleType), and "who approved this" is a
+// batch-level fact, not a per-employee one. Corrected here via a proper
+// migration rather than worked around, since Phase 1/2 never had a live
+// deployment to preserve compatibility with. See docs/architecture.md.
+// ---------------------------------------------------------------------------
+
+enum PayrollRunType {
+  REGULAR
+  OFF_CYCLE
+  CORRECTION
+}
+
+enum PayrollRunStatus {
+  DRAFT
+  CALCULATING
+  CALCULATED
+  UNDER_REVIEW
+  APPROVED
+  FINALIZED
+  VOIDED
+  FAILED
+}
+
+// One payroll batch for one organization/period. Owns the lifecycle state
+// machine (see apps/api/src/payroll/payroll-run-lifecycle.ts) and pins the
+// exact StatutoryRuleVersion used for each rule type via
+// PayrollRunStatutoryRule — every PayrollRecord in the run inherits that
+// pinning, so a FINALIZED run's numbers can always be reproduced even after
+// newer statutory rules are seeded later (see §38 in the Phase 3 brief:
+// historical payroll must remain tied to the ruleset used when finalized).
+model PayrollRun {
+  id                 String            @id @default(uuid()) @db.Uuid
+  organizationId     String            @map("organization_id") @db.Uuid
+  runType            PayrollRunType    @default(REGULAR) @map("run_type")
+  status             PayrollRunStatus  @default(DRAFT)
+
+  payrollPeriodStart DateTime          @map("payroll_period_start") @db.Date
+  payrollPeriodEnd   DateTime          @map("payroll_period_end") @db.Date
+  currency           String            @db.Char(3)
+
+  employeeCount              Int      @default(0) @map("employee_count")
+  grossTotal                 Decimal  @default(0) @map("gross_total") @db.Decimal(16, 2)
+  taxablePayTotal              Decimal @default(0) @map("taxable_pay_total") @db.Decimal(16, 2)
+  payeTotal                    Decimal @default(0) @map("paye_total") @db.Decimal(16, 2)
+  nssfEmployeeTotal              Decimal @default(0) @map("nssf_employee_total") @db.Decimal(16, 2)
+  nssfEmployerTotal               Decimal @default(0) @map("nssf_employer_total") @db.Decimal(16, 2)
+  shifTotal                        Decimal @default(0) @map("shif_total") @db.Decimal(16, 2)
+  housingLevyEmployeeTotal           Decimal @default(0) @map("housing_levy_employee_total") @db.Decimal(16, 2)
+  housingLevyEmployerTotal            Decimal @default(0) @map("housing_levy_employer_total") @db.Decimal(16, 2)
+  otherDeductionsTotal                  Decimal @default(0) @map("other_deductions_total") @db.Decimal(16, 2)
+  netPayrollTotal                        Decimal @default(0) @map("net_payroll_total") @db.Decimal(16, 2)
+  totalEmploymentCost                     Decimal @default(0) @map("total_employment_cost") @db.Decimal(16, 2)
+
+  engineVersion      String?           @map("engine_version")
+
+  createdByUserId    String            @map("created_by_user_id") @db.Uuid
+  approvedByUserId   String?           @map("approved_by_user_id") @db.Uuid
+  approvedAt         DateTime?         @map("approved_at")
+  finalizedAt        DateTime?         @map("finalized_at")
+  voidedAt           DateTime?         @map("voided_at")
+  voidedReason       String?           @map("voided_reason")
+  failureReason      String?           @map("failure_reason")
+
+  organization       Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  createdBy          User              @relation("PayrollRunCreatedBy", fields: [createdByUserId], references: [id], onDelete: Restrict)
+  approvedBy         User?             @relation("PayrollRunApprovedBy", fields: [approvedByUserId], references: [id], onDelete: SetNull)
+  records            PayrollRecord[]
+  statutoryRules     PayrollRunStatutoryRule[]
+  complianceEvaluations ComplianceEvaluation[]
+
+  createdAt          DateTime          @default(now()) @map("created_at")
+  updatedAt          DateTime          @updatedAt @map("updated_at")
+
+  // The idempotency guarantee from brief §21: one (organization, period,
+  // runType) combination can have at most one run. A genuine re-run needs an
+  // explicit CORRECTION-type run, not a silent duplicate.
+  @@unique([organizationId, payrollPeriodStart, payrollPeriodEnd, runType])
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@map("payroll_runs")
+}
+
+// Pins exactly which StatutoryRuleVersion (one per rule type) a run used.
+model PayrollRunStatutoryRule {
+  payrollRunId           String                @map("payroll_run_id") @db.Uuid
+  ruleType                StatutoryRuleType    @map("rule_type")
+  statutoryRuleVersionId    String              @map("statutory_rule_version_id") @db.Uuid
+
+  payrollRun               PayrollRun          @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+  statutoryRuleVersion       StatutoryRuleVersion @relation(fields: [statutoryRuleVersionId], references: [id], onDelete: Restrict)
+
+  @@id([payrollRunId, ruleType])
+  @@map("payroll_run_statutory_rules")
+}
+
+// One employee's calculation within a PayrollRun. Immutable in practice once
+// its run reaches FINALIZED — the lifecycle guard, not a DB trigger, enforces
+// that (see PayrollService). `calculationSteps` + `engineVersion` exist
+// specifically so an auditor can reconstruct exactly how netPay was derived
+// without re-running the engine (brief §38).
+model PayrollRecord {
+  id                 String     @id @default(uuid()) @db.Uuid
+  organizationId     String     @map("organization_id") @db.Uuid
+  employeeId         String     @map("employee_id") @db.Uuid
+  contractId         String?    @map("contract_id") @db.Uuid
+  payrollRunId       String     @map("payroll_run_id") @db.Uuid
+
+  payrollPeriodStart DateTime   @map("payroll_period_start") @db.Date
+  payrollPeriodEnd   DateTime   @map("payroll_period_end") @db.Date
+  currency           String     @db.Char(3)
+
+  grossPay           Decimal    @map("gross_pay") @db.Decimal(14, 2)
+  cashPay            Decimal    @map("cash_pay") @db.Decimal(14, 2)
+  nonCashBenefits    Decimal    @default(0) @map("non_cash_benefits") @db.Decimal(14, 2)
+  taxableBenefits    Decimal    @default(0) @map("taxable_benefits") @db.Decimal(14, 2)
+  taxableIncome      Decimal    @map("taxable_income") @db.Decimal(14, 2)
+
+  payeBeforeRelief   Decimal    @map("paye_before_relief") @db.Decimal(14, 2)
+  personalRelief     Decimal    @map("personal_relief") @db.Decimal(14, 2)
+  otherReliefs       Decimal    @default(0) @map("other_reliefs") @db.Decimal(14, 2)
+  payeAmount         Decimal    @map("paye_amount") @db.Decimal(14, 2)
+
+  nssfEmployeeAmount        Decimal @map("nssf_employee_amount") @db.Decimal(14, 2)
+  nssfEmployerAmount         Decimal @map("nssf_employer_amount") @db.Decimal(14, 2)
+  shifAmount                  Decimal @map("shif_amount") @db.Decimal(14, 2)
+  housingLevyEmployeeAmount     Decimal @map("housing_levy_employee_amount") @db.Decimal(14, 2)
+  housingLevyEmployerAmount      Decimal @map("housing_levy_employer_amount") @db.Decimal(14, 2)
+  allowableDeductions              Json? @map("allowable_deductions") @db.JsonB // [{ type, amount, taxTreatment }]
+  otherDeductions                    Json? @map("other_deductions") @db.JsonB // [{ label, amount }] non-statutory
+
+  totalEmployeeDeductions  Decimal  @map("total_employee_deductions") @db.Decimal(14, 2)
+  employerStatutoryCost     Decimal @map("employer_statutory_cost") @db.Decimal(14, 2)
+  netPay                     Decimal @map("net_pay") @db.Decimal(14, 2)
+  totalEmploymentCost         Decimal @map("total_employment_cost") @db.Decimal(14, 2)
+  effectiveTaxRate              Decimal @map("effective_tax_rate") @db.Decimal(7, 4)
+
+  calculationSteps   Json       @map("calculation_steps") @db.JsonB
+  engineVersion      String     @map("engine_version")
+
+  organization       Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  employee            Employee     @relation(fields: [employeeId], references: [id], onDelete: Restrict)
+  contract              Contract?  @relation(fields: [contractId], references: [id], onDelete: SetNull)
+  payrollRun              PayrollRun @relation(fields: [payrollRunId], references: [id], onDelete: Cascade)
+
+  createdAt          DateTime   @default(now()) @map("created_at")
+  updatedAt          DateTime   @updatedAt @map("updated_at")
+
+  @@unique([payrollRunId, employeeId])
+  @@index([organizationId])
+  @@index([employeeId])
+  @@index([organizationId, payrollPeriodStart])
+  @@index([payrollRunId])
+  @@map("payroll_records")
+}
+
+// ---------------------------------------------------------------------------
+// AI governance — audit logging
+// ---------------------------------------------------------------------------
+
+enum AIRequestStatus {
+  PENDING
+  SUCCESS
+  FAILURE
+  REJECTED
+}
+
+enum AIReviewDecision {
+  APPROVED
+  REJECTED
+  NOT_REQUIRED
+}
+
+// Governance record for AI activity. Deliberately stores REFERENCES to
+// prompts/outputs (e.g. object-storage keys or content hashes), not raw
+// prompt/document text — see packages/types for the InputRef/OutputRef shape.
+model AIAuditLog {
+  id                   String            @id @default(uuid()) @db.Uuid
+  organizationId       String            @map("organization_id") @db.Uuid
+  requestingUserId     String?           @map("requesting_user_id") @db.Uuid // null for system/scheduled AI activity
+
+  agentService         String            @map("agent_service") // e.g. "ai-orchestrator", "resume-parser"
+  modelIdentifier       String           @map("model_identifier") // e.g. "claude-sonnet-5"
+  requestType          String            @map("request_type") // e.g. "document_analysis", "candidate_screening"
+
+  inputRef             String?           @map("input_ref") // pointer/hash to input payload, never raw content
+  outputRef            String?           @map("output_ref") // pointer/hash to output payload, never raw content
+
+  status               AIRequestStatus   @default(PENDING)
+  errorSummary         String?           @map("error_summary")
+
+  promptTokens         Int?              @map("prompt_tokens")
+  completionTokens     Int?              @map("completion_tokens")
+  latencyMs            Int?              @map("latency_ms")
+  toolsUsed            Json?             @map("tools_used") @db.JsonB
+
+  requiresHumanReview  Boolean           @default(false) @map("requires_human_review")
+  reviewDecision       AIReviewDecision? @map("review_decision")
+  reviewedByUserId     String?           @map("reviewed_by_user_id") @db.Uuid
+  reviewedAt           DateTime?         @map("reviewed_at")
+
+  organization         Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requestingUser        User?            @relation("AIAuditRequestingUser", fields: [requestingUserId], references: [id], onDelete: SetNull)
+  reviewedBy             User?           @relation("AIAuditReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+
+  createdAt            DateTime          @default(now()) @map("created_at")
+
+  @@index([organizationId])
+  @@index([organizationId, createdAt])
+  @@index([requestingUserId])
+  @@index([status])
+  @@map("ai_audit_logs")
+}

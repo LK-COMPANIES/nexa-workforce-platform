@@ -1,0 +1,26 @@
+{
+  "name": "@nexa/auth",
+  "version": "0.1.0",
+  "private": true,
+  "description": "RBAC primitives (roles, permissions, role→permission matrix), password hashing, and JWT issuance/verification shared across Nexa services.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "lint": "eslint src --ext .ts",
+    "test": "jest"
+  },
+  "dependencies": {
+    "@nexa/types": "*",
+    "argon2": "^0.41.1",
+    "jsonwebtoken": "^9.0.2"
+  },
+  "devDependencies": {
+    "@types/jest": "^29.5.13",
+    "@types/jsonwebtoken": "^9.0.7",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.5",
+    "typescript": "^5.6.0"
+  }
+}

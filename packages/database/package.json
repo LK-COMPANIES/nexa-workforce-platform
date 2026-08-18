@@ -1,0 +1,37 @@
+{
+  "name": "@nexa/database",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Prisma schema, generated client, and tenant-isolation primitives shared by all Nexa services.",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "prisma generate && tsc -p tsconfig.json",
+    "dev": "prisma generate && tsc -p tsconfig.json --watch --preserveWatchOutput",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:deploy": "prisma migrate deploy",
+    "db:rls": "tsx scripts/apply-rls.ts",
+    "db:seed": "tsx prisma/seed.ts",
+    "test:integration": "tsx test/tenant-isolation.integration.ts && tsx test/payroll-contracts-tenant-isolation.integration.ts",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@nexa/auth": "*",
+    "@nexa/config": "*",
+    "@nexa/types": "*",
+    "@nexa/validation": "*",
+    "@prisma/client": "^5.20.0",
+    "pg": "^8.13.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.0",
+    "@types/pg": "^8.11.10",
+    "prisma": "^5.20.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "prisma": {
+    "seed": "tsx prisma/seed.ts"
+  }
+}
