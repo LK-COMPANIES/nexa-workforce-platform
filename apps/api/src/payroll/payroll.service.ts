@@ -1,7 +1,8 @@
 import { ForbiddenException, Injectable } from "@nestjs/common";
 import type { Prisma, PayrollRecord, PayrollRun, StatutoryRuleType } from "@prisma/client";
-import { PAYROLL_ENGINE_VERSION, type PayrollCalculationResult } from "@nexa/payroll-engine";
-import type { CreatePayrollRunInput } from "@nexa/validation";
+import { calculateKenyaPayroll, PAYROLL_ENGINE_VERSION, type PayrollCalculationResult } from "@nexa/payroll-engine";
+import type { CreatePayrollRunInput, PayrollCalculatorInput } from "@nexa/validation";
+import { randomUUID } from "node:crypto";
 import { PrismaService } from "../prisma/prisma.service";
 import type { RequestTenantContext } from "../tenancy/types";
 import { PayrollCalculationService } from "./payroll-calculation.service";
@@ -106,6 +107,37 @@ export class PayrollService {
     private readonly rulesLoader: StatutoryRulesLoader,
     private readonly calculationService: PayrollCalculationService,
   ) {}
+
+  // Ad-hoc "what-if" calculation (brief §14) — reuses the exact same pure
+  // engine and active statutory rules as a real payroll run, but persists
+  // NOTHING. Still runs inside runWithTenant(): loading which statutory
+  // rules apply is itself a tenant-scoped read (today only KE, but the
+  // rules loader is jurisdiction-aware), and this keeps the operation
+  // consistent with every other tenant-scoped code path even though there's
+  // no write. The frontend calculator MUST call this — brief §14 explicitly
+  // forbids reimplementing PAYE/NSSF/SHIF/Housing Levy in React.
+  async calculatePreview(
+    tenant: RequestTenantContext,
+    input: PayrollCalculatorInput,
+  ): Promise<PayrollCalculationResult> {
+    return this.prisma.runWithTenant({ tenantId: tenant.organizationId, userId: tenant.userId }, async (tx) => {
+      const { rules } = await this.rulesLoader.loadActiveKenyaRules(tx, input.payrollPeriodStart);
+      return calculateKenyaPayroll({
+        employeeId: randomUUID(),
+        period: {
+          start: input.payrollPeriodStart.toISOString().slice(0, 10),
+          end: input.payrollPeriodEnd.toISOString().slice(0, 10),
+        },
+        currency: input.currency,
+        cashGrossPay: input.cashGrossPay,
+        nonCashBenefits: input.nonCashBenefits,
+        allowableDeductions: input.allowableDeductions,
+        otherDeductions: input.otherDeductions,
+        taxResidencyStatus: "RESIDENT",
+        rules,
+      });
+    });
+  }
 
   async createRun(tenant: RequestTenantContext, input: CreatePayrollRunInput): Promise<PayrollRun> {
     // The DB unique constraint (organizationId, payrollPeriodStart,

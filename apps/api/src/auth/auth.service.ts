@@ -32,6 +32,15 @@ interface AuthLookupRow {
   is_platform_super_admin: boolean;
 }
 
+interface MembershipLookupRow {
+  organization_id: string;
+  organization_display_name: string;
+  organization_type: string;
+  role_key: string;
+  role_name: string;
+  membership_status: string;
+}
+
 interface RefreshLookupRow {
   refresh_token_id: string;
   family_id: string;
@@ -493,6 +502,141 @@ export class AuthService {
         });
       },
     );
+  }
+
+  // Lists every organization the AUTHENTICATED caller belongs to — the
+  // "Authorized Memberships" step in brief §12's switching flow. Uses the
+  // auth_list_user_memberships bootstrap function (a cross-tenant read,
+  // hence the SECURITY DEFINER escape hatch — see the RLS migration) but is
+  // safe specifically because `tenant.userId` comes from the guard-validated
+  // session, never from a client-supplied parameter: a caller can only ever
+  // learn about their own memberships.
+  async listMemberships(tenant: RequestTenantContext) {
+    const rows = await this.prisma.client.$queryRaw<MembershipLookupRow[]>`
+      SELECT * FROM auth_list_user_memberships(${tenant.userId}::uuid)
+    `;
+    return rows.map((row) => ({
+      organizationId: row.organization_id,
+      organizationDisplayName: row.organization_display_name,
+      organizationType: row.organization_type,
+      roleKey: row.role_key,
+      roleName: row.role_name,
+      status: row.membership_status,
+    }));
+  }
+
+  // Switches the caller's active tenant WITHOUT re-entering a password —
+  // the already-validated session (JwtAuthGuard + TenantContextGuard) is
+  // the credential; only membership in the TARGET organization still needs
+  // verifying. Mirrors login()'s membership-resolution exactly (brief §12:
+  // "never allow a user to type an arbitrary organization UUID... and gain
+  // access") — a platform super-admin may switch to any organization that
+  // exists (audited as SUPER_ADMIN_ORG_ACCESS, same as at login); anyone
+  // else needs a live ACTIVE OrganizationMembership row, or the switch is
+  // rejected with the exact same generic error login() itself uses.
+  async switchOrganization(
+    tenant: RequestTenantContext,
+    targetOrganizationId: string,
+    meta: RequestMetadata,
+  ) {
+    const genericFailure = () => new UnauthorizedException("Not authorized for the requested organization");
+
+    const result = await this.prisma.runWithTenant(
+      { tenantId: targetOrganizationId, userId: tenant.userId },
+      async (tx) => {
+        const user = await tx.user.findUnique({ where: { id: tenant.userId } });
+        if (!user || !user.isActive) {
+          return null;
+        }
+
+        let roleKey: string;
+        let permissions: PermissionKey[];
+        let isSuperAdminSession = false;
+
+        if (user.isPlatformSuperAdmin) {
+          const targetOrganization = await tx.organization.findUnique({ where: { id: targetOrganizationId } });
+          if (!targetOrganization) {
+            return null;
+          }
+          const role = await tx.role.findUniqueOrThrow({
+            where: { key: "nexa_super_admin" },
+            include: { permissions: { include: { permission: true } } },
+          });
+          roleKey = role.key;
+          permissions = role.permissions.map((rp) => rp.permission.key) as PermissionKey[];
+          isSuperAdminSession = true;
+        } else {
+          const membership = await tx.organizationMembership.findFirst({
+            where: { userId: tenant.userId, organizationId: targetOrganizationId, status: "ACTIVE" },
+            include: { role: { include: { permissions: { include: { permission: true } } } } },
+          });
+          if (!membership) {
+            return null;
+          }
+          roleKey = membership.role.key;
+          permissions = membership.role.permissions.map((rp) => rp.permission.key) as PermissionKey[];
+        }
+
+        const session = await this.sessionService.createSession(tx, {
+          userId: tenant.userId,
+          organizationId: targetOrganizationId,
+          isSuperAdminSession,
+          ipAddress: meta.ip,
+          userAgent: meta.userAgent,
+        });
+        const { raw: refreshToken } = await this.refreshTokenService.issueInitial(tx, session.id);
+
+        const accessToken = signAccessToken(
+          {
+            sub: tenant.userId,
+            organization_id: targetOrganizationId,
+            session_id: session.id,
+            role_key: roleKey,
+            token_type: "access",
+          },
+          this.tokenIssuerConfig,
+          this.config.env.JWT_ACCESS_TTL,
+        );
+
+        await tx.authenticationAuditEvent.create({
+          data: {
+            organizationId: targetOrganizationId,
+            actingUserId: tenant.userId,
+            sessionId: session.id,
+            eventType: isSuperAdminSession ? "SUPER_ADMIN_ORG_ACCESS" : "LOGIN_SUCCESS",
+            ipAddress: meta.ip,
+            userAgent: meta.userAgent?.slice(0, 512),
+            metadata: { via: "switch_organization", fromOrganizationId: tenant.organizationId },
+          },
+        });
+
+        return {
+          accessToken,
+          refreshToken,
+          roleKey,
+          permissions,
+          user: { id: user.id, email: user.email },
+        };
+      },
+    );
+
+    if (!result) {
+      await this.auditService.record({
+        organizationId: targetOrganizationId,
+        actingUserId: tenant.userId,
+        eventType: "TENANT_ACCESS_DENIED",
+        meta,
+        metadata: { reason: "switch_organization_unauthorized", fromOrganizationId: tenant.organizationId },
+      });
+      throw genericFailure();
+    }
+
+    return {
+      accessToken: result.accessToken,
+      refreshToken: result.refreshToken,
+      user: result.user,
+      tenant: { organizationId: targetOrganizationId, roleKey: result.roleKey, permissions: result.permissions },
+    };
   }
 
   async me(tenant: RequestTenantContext) {

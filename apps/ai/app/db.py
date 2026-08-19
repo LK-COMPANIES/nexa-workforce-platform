@@ -1,3 +1,4 @@
+import json
 import re
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -13,11 +14,25 @@ _UUID_PATTERN = re.compile(
 _pool: Optional[asyncpg.Pool] = None
 
 
+async def _init_connection(connection: asyncpg.Connection) -> None:
+    # asyncpg returns json/jsonb columns as raw text by default. Registering
+    # this codec on every pooled connection means every jsonb column (ai_jobs
+    # .result_json, compliance_evaluations.findings, contracts.terms, etc.)
+    # comes back as an already-parsed Python object everywhere in this
+    # service, matching how Prisma behaves for apps/api.
+    await connection.set_type_codec(
+        "jsonb", encoder=json.dumps, decoder=json.loads, schema="pg_catalog", format="text"
+    )
+    await connection.set_type_codec(
+        "json", encoder=json.dumps, decoder=json.loads, schema="pg_catalog", format="text"
+    )
+
+
 async def get_pool() -> asyncpg.Pool:
     global _pool
     if _pool is None:
         settings = get_settings()
-        _pool = await asyncpg.create_pool(dsn=settings.database_url)
+        _pool = await asyncpg.create_pool(dsn=settings.database_url, init=_init_connection)
     return _pool
 
 

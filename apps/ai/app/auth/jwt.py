@@ -2,9 +2,9 @@ from typing import Annotated, Optional
 
 import jwt
 from fastapi import Header, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
-from .config import get_settings
+from ..config import get_settings
 
 
 class CallerClaims(BaseModel):
@@ -15,6 +15,12 @@ class CallerClaims(BaseModel):
     not a permissions list that could go stale in transit. This service
     trusts tokens issued by apps/api's login flow — it never issues its own,
     and is never called directly by a browser (no CORS is configured here).
+
+    organization_id here is the SOLE source of tenant scope for every agent
+    request this service handles. No agent request schema in app/schemas
+    accepts an organization_id field from the caller — see
+    services/contract_repository.py for why that is the actual enforcement
+    mechanism, not just a convention.
     """
 
     sub: str
@@ -43,7 +49,17 @@ def verify_caller(authorization: Annotated[Optional[str], Header()] = None) -> C
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired token"
         ) from exc
 
-    claims = CallerClaims(**payload)
+    try:
+        claims = CallerClaims(**payload)
+    except ValidationError as exc:
+        # A syntactically valid, correctly-signed JWT that is nonetheless
+        # missing a required claim (e.g. organization_id) is still an
+        # authentication failure, not a server error — must not surface as
+        # an unhandled 500.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Token payload missing required claims"
+        ) from exc
+
     if claims.token_type != "access":
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not an access token")
     return claims

@@ -15,7 +15,9 @@ export class JwtAuthGuard implements CanActivate {
   constructor(private readonly config: ApiConfigService) {}
 
   canActivate(context: ExecutionContext): boolean {
-    const request = context.switchToHttp().getRequest<Request & { tenantContext?: RequestTenantContext }>();
+    const request = context
+      .switchToHttp()
+      .getRequest<Request & { tenantContext?: RequestTenantContext; rawAccessToken?: string }>();
     const header = request.headers.authorization;
     if (!header?.startsWith("Bearer ")) {
       throw new UnauthorizedException("Missing bearer token");
@@ -36,6 +38,11 @@ export class JwtAuthGuard implements CanActivate {
         permissions: [] as PermissionKey[],
         isSuperAdminSession: false,
       };
+      // Retained verbatim (not re-derived) so downstream service-to-service
+      // calls — currently only AiService forwarding to apps/ai — can present
+      // the exact token this guard just verified, rather than apps/api
+      // minting a second, parallel credential. See CurrentAccessToken().
+      request.rawAccessToken = token;
       return true;
     } catch {
       throw new UnauthorizedException("Invalid or expired token");

@@ -36,6 +36,15 @@ export class ContractsController {
     return this.contractsService.list(tenant);
   }
 
+  // Registered before ":id" so the literal "compliance/summary" segment
+  // pair is never mistaken for a contract id — the Compliance Health Index
+  // (brief §9) data source.
+  @Get("compliance/summary")
+  @RequirePermission("contract:read")
+  complianceSummary(@CurrentTenant() tenant: RequestTenantContext) {
+    return this.complianceService.getOrganizationComplianceSummary(tenant);
+  }
+
   @Get(":id")
   @RequirePermission("contract:read")
   get(@Param("id", new ZodValidationPipe(idParamSchema)) id: string, @CurrentTenant() tenant: RequestTenantContext) {

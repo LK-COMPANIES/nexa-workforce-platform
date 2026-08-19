@@ -5,10 +5,12 @@ import {
   refreshTokenSchema,
   registerClientOrganizationSchema,
   revokeSessionSchema,
+  switchOrganizationSchema,
   type LoginInput,
   type RefreshTokenInput,
   type RegisterClientOrganizationInput,
   type RevokeSessionInput,
+  type SwitchOrganizationInput,
 } from "@nexa/validation";
 import { ZodValidationPipe } from "../common/zod-validation.pipe";
 import { extractRequestMetadata } from "../common/request-metadata.util";
@@ -69,5 +71,24 @@ export class AuthController {
   @UseGuards(JwtAuthGuard, TenantContextGuard)
   me(@CurrentTenant() tenant: RequestTenantContext) {
     return this.authService.me(tenant);
+  }
+
+  // The organization switcher's data source (brief §12/§21) — every org the
+  // caller is authorized to switch into.
+  @Get("memberships")
+  @UseGuards(JwtAuthGuard, TenantContextGuard)
+  listMemberships(@CurrentTenant() tenant: RequestTenantContext) {
+    return this.authService.listMemberships(tenant);
+  }
+
+  @Post("switch-organization")
+  @HttpCode(200)
+  @UseGuards(JwtAuthGuard, TenantContextGuard)
+  switchOrganization(
+    @Body(new ZodValidationPipe(switchOrganizationSchema)) body: SwitchOrganizationInput,
+    @CurrentTenant() tenant: RequestTenantContext,
+    @Req() request: Request,
+  ) {
+    return this.authService.switchOrganization(tenant, body.organizationId, extractRequestMetadata(request));
   }
 }

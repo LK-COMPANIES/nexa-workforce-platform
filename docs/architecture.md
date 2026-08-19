@@ -1,4 +1,4 @@
-# Nexa Workforce Solutions — Architecture (Phase 1 + Phase 2 + Phase 3)
+# Nexa Workforce Solutions — Architecture (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
 ## 1. Repository layout
 
@@ -387,3 +387,226 @@ automatic rejection, until that verification happens.
    `ContractDocumentModel`) — PDF/DOCX generation was explicitly out of
    scope (brief §31: the compliance engine must not be coupled to a
    renderer).
+
+## 15. Phase 4 — multi-tenant web dashboard & AI orchestration
+
+### Frontend architecture (`apps/web`)
+
+Next.js 14 App Router, Server Components by default. Two httpOnly cookies
+(`nexa_access_token`, `nexa_refresh_token`) are the entire browser-visible
+auth surface — set/read/cleared exclusively in server code
+(`lib/auth/cookies.ts`, `lib/api/server-fetch.ts`); no token, permission
+array, or Anthropic credential is ever sent to client JavaScript.
+`middleware.ts` does proactive silent refresh (Server Components cannot
+mutate cookies mid-render, so by the time one renders its cookies are
+already fresh) and coarse route protection; **this is a UX optimization,
+not the security boundary** — every backend call independently re-verifies
+the token regardless (brief §6).
+
+All backend calls funnel through one function, `apiFetch()`
+(`lib/api/server-fetch.ts`) — no scattered `fetch()` calls (brief §21) —
+which attaches the access token, retries once through silent refresh on
+401, and throws a typed `ApiError` subclass (401/403/404/409/422/429/5xx)
+that `ApiErrorCard` renders distinctly per page. Mutations are Server
+Actions (`"use server"`); `useFormState`/`useFormStatus` from `react-dom`
+(not `useActionState` from `react` — this project is on React 18.3, not
+19). `packages/ui` is a hand-written shadcn-pattern component library
+(Radix primitives + CVA + `tailwind-merge`), not the shadcn CLI, since that
+requires network registry access this environment doesn't have.
+
+**Tenant switching**: `GET /auth/memberships` returns only the caller's own
+authorized memberships; `OrgSwitcher` can only submit an `organizationId`
+sourced from that list — never a free-typed UUID (brief §12). The backend
+(`AuthService.switchOrganization`) independently re-validates: a platform
+super-admin may switch into any existing organization (audited as
+`SUPER_ADMIN_ORG_ACCESS`), everyone else needs a live `ACTIVE`
+`OrganizationMembership` row, checked fresh at switch time — not cached
+from login. On success, `switchOrganizationDirect` redirects to
+`/dashboard` (a full navigation, not an in-place revalidation), which is
+what actually prevents stale previous-tenant data from lingering in any
+Server Component's render tree.
+
+**No fabricated dashboard metrics** (brief §8): `/dashboard`'s 9-division
+intelligence grid and "Active BPO Seats" render `NoOperationalData` because
+no backend data source exists for them yet — same principle applied
+project-wide (`organizations` page has no admin/invite flow yet because
+that would need a new RLS-bypass pattern not yet designed; it says so
+rather than faking it).
+
+### AI orchestration service (`apps/ai`)
+
+Restructured from a single-file FastAPI app into
+`auth/ · middleware/ · orchestration/ · schemas/ · services/ · agents/{contract_audit,bpo_qa}/`.
+Two agents, both following the same shape:
+
+1. **`create_job()`** (synchronous, fast): resolves the request's
+   `contract_id` inside `tenant_transaction(caller.organization_id, ...)`
+   and creates a `PENDING` `AiJob` row. **`organization_id` is never a field
+   on any agent request schema** (`ContractAuditRequest`, `BpoQaRequest`) —
+   the caller's JWT is the *only* source of tenant scope this service ever
+   consults. A `contract_id` belonging to another tenant is invisible to
+   the RLS-scoped query, full stop — there is no `organization_id`
+   comparison to get wrong, because there is no comparison at all.
+2. **`execute_job()`** (async, backgrounded): scheduled via FastAPI
+   `BackgroundTasks` so the 202 response returns immediately and the Claude
+   call never blocks the HTTP request. Calls Claude with a forced tool-use
+   turn (`tool_choice={"type":"tool",...}`) whose `input_schema` is the
+   agent's own Pydantic model's JSON schema, then re-validates the model's
+   tool input against that same Pydantic model before it is ever persisted
+   — the "strict Pydantic-schema-validated Claude outputs" requirement.
+   Every attempt, success or failure, writes exactly one `AIAuditLog` row
+   (hashed input/output refs only, never raw text — reusing the existing
+   Phase 1 governance table) and updates the `AiJob` row's terminal state
+   in the same transaction.
+
+**Contract audit** output uses a deliberately different severity
+vocabulary (`INFO`/`ADVISORY`/`CONCERN`) from the deterministic engine's
+`PASS`/`WARNING`/`FAIL`/`REQUIRES_HUMAN_REVIEW`, carries a fixed disclaimer
+field, and its system prompt is explicitly instructed not to re-derive or
+contradict the deterministic result it's given as read-only context — the
+"AI-generated legal analysis must be clearly distinguished from
+deterministic compliance results" requirement (brief §20), enforced at the
+schema and prompt level, not just the UI. `ContractAiAuditPanel.tsx` on the
+frontend reinforces this with distinct styling (violet accent, "Sparkles"
+icon, an "AI-generated" badge on every render path) — never sharing a
+component with `ComplianceFindingsPanel`.
+
+**BPO QA** evaluates a real, user-submitted interaction transcript against
+a contract's service terms — it never fabricates call/interaction data,
+and is only offered for `OUTSOURCED_WORKFORCE`/`CLIENT_SERVICES_AGREEMENT`
+contracts (checked server-side, not just hidden in the UI). Its backend
+agent and tests exist; **no frontend screen consumes it yet** — Task
+scope for this phase was the contract-audit UI panel specifically (brief
+§24's frontend/AI integration item), so BPO QA is complete and tested at
+the API boundary but not yet wired into a page. Documented gap, not a
+hidden one.
+
+**Prompt versioning**: each agent's system/user prompt lives in
+`orchestration/prompts/{agent}_v1.py` with an explicit `PROMPT_VERSION`
+string, persisted on every `AiJob` row. Changing prompt wording requires
+bumping that string — there is no other way to change it in production.
+
+**Rate limiting**: Redis, fixed-window, keyed by `organization_id` (not
+per-user, so one tenant can't spread requests across accounts to bypass
+it). **Fails open** on Redis unavailability — a deliberate choice, since
+this is a cost/abuse control, not a security boundary (RLS is); documented
+in `middleware/rate_limit.py`'s own docstring and covered by a test that
+asserts the fail-open behavior explicitly, not just the fail-closed path.
+
+**Oversized-payload guard**: `middleware/request_size.py` rejects a
+request with `Content-Length` over `AI_MAX_INPUT_SIZE` (default 50 KB)
+with 413, before the body is parsed or reaches Claude — a fast-path cost
+control, not the sole enforcement (a client lying about `Content-Length`
+is still bounded upstream by uvicorn's own request handling).
+
+**No sensitive logging**: neither service logs prompt text, transcript
+content, model output, or the bearer token anywhere — `apps/ai`'s
+`logging.basicConfig` call and its own top-of-file comment in `main.py`
+make this an explicit constraint, not an accident; `apps/api`'s new `ai/`
+module has no logging calls at all.
+
+### The NestJS boundary (`apps/api/src/ai`)
+
+`AiService`/`AiController` proxy `POST /contracts/:id/ai-audit` and
+`GET /ai/jobs/:jobId` to `apps/ai`, forwarding the **same** access token
+`JwtAuthGuard` just verified for the incoming request (stashed on
+`request.rawAccessToken`, read via a new `@CurrentAccessToken()`
+decorator) — deliberately not minting a second, parallel credential.
+`apps/ai` re-verifies that token independently and derives
+`organization_id` from it itself; apps/api forwarding it is a convenience,
+never a trust shortcut apps/ai relies on. The Anthropic API key exists
+nowhere in `apps/api` or `apps/web` — only in `apps/ai`'s own environment.
+
+### What changed in this phase's audit
+
+- **A malformed-but-correctly-signed JWT payload (missing a required
+  claim) in `apps/ai`'s `verify_caller`** would have raised an unhandled
+  `pydantic.ValidationError`, surfacing as a 500 rather than a 401 —
+  caught during test-writing, fixed by catching `ValidationError`
+  explicitly and converting it to the same 401 every other auth failure
+  produces. Regression-tested.
+- **asyncpg does not auto-decode `jsonb` columns** — without a registered
+  type codec, `AiJob.result_json` (and every other jsonb column this
+  service touches) would come back as a raw JSON *string*, silently
+  breaking `JobStatusResponse`'s Pydantic validation the first time a real
+  row was read. Fixed by registering `json`/`jsonb` codecs on every pooled
+  connection in `db.py`, matching how Prisma already behaves for
+  `apps/api` — caught by design review before it ever shipped, since no
+  live Postgres was available here to catch it by running the code.
+- **Radix `Select`'s `name` prop already renders an internal hidden native
+  `<select>`** for form association; an earlier draft of
+  `CreateRunDialog.tsx` (Phase 4 payroll work) added a *second*, manual
+  hidden input with the same `name`, which would have caused
+  `formData.get()` to silently return whichever value came first in DOM
+  order regardless of the user's actual selection. Removed before it
+  shipped.
+- **Tenant-switching authorization had zero test coverage** before this
+  phase, despite being one of the highest-consequence code paths in the
+  system (`AuthService.switchOrganization`, unchanged since Phase 2). Six
+  new tests now cover: valid membership switch, no membership, inactive
+  user, and the platform-super-admin bypass (both the allowed and the
+  target-organization-does-not-exist cases).
+
+### Verification performed vs. not performed this phase
+
+Executed and passing: 224 TypeScript tests across `packages/auth`,
+`packages/payroll-engine`, `packages/validation` (new), and `apps/api`
+(`npx jest`), plus 39 new `apps/web` tests (`npx jest`, first Jest setup
+for this app — `next/jest` + `jest-environment-jsdom` +
+`@testing-library/react`) covering the API error hierarchy, permission
+gating, `ApiErrorCard`'s branch logic, payroll lifecycle button-visibility
+gating, and `middleware.ts`'s route-protection/refresh decisions via a
+real `NextRequest`. Every `apps/web` and `apps/api` page/route touched this
+phase was also verified via a clean, fully type-checked `next build` /
+`nest build`.
+
+**Not executed**: `apps/ai`'s entire Python test suite (7 files, ~40 cases,
+including the mandatory "Tenant A JWT + Tenant B request body → REJECT"
+test) — this environment has no Python interpreter at all (confirmed: only
+an empty, binary-less `Python313` directory on `PATH`). The suite was
+written carefully, mocks the Postgres/Redis/Anthropic boundaries
+deliberately rather than requiring live infrastructure, and is documented
+in its own `conftest.py` docstring as unexecuted — run
+`pip install -r requirements-dev.txt && pytest` before trusting it. This
+mirrors the same honesty pattern applied to the Phase 3 RLS integration
+tests (§14, item 1): written, reasoned about carefully, not proof of
+correctness until actually run.
+
+No live browser walkthrough of login → dashboard → org-switch → contract
+audit was possible in this environment either, for the same reason
+Phase 1–3 couldn't: no Docker/Postgres/Redis here to actually run the
+stack end-to-end. Everything above is build/type/unit-test verified, not
+manually clicked through.
+
+## 16. Architectural risks to resolve before Phase 5
+
+1. **`apps/ai`'s test suite has never been executed** — see §15. Run it in
+   a real environment before trusting the tenant-isolation guarantees it
+   asserts, same caveat as the Phase 3 RLS integration tests (item 2
+   below) — neither has ever actually touched a live Postgres in this
+   environment.
+2. **The Phase 3 RLS integration test still has not been executed against
+   a real database** (carried over from §14 — still unresolved; Phase 4
+   added `ai_jobs` to the same RLS-protected table set via
+   `005_phase4_ai_jobs.sql`, following the exact pattern of
+   `001`–`004`, but it inherits the same "written, not run" caveat).
+3. **`apps/ai`'s async job execution uses FastAPI `BackgroundTasks`**, not
+   a distributed task queue — genuinely async (never blocks the HTTP
+   response, runs concurrently on the same event loop), but in-process and
+   single-instance. Fine at current scale; horizontally scaling `apps/ai`
+   to multiple replicas would need a real queue (Celery/RQ) with Redis or
+   similar as the broker, not a rewrite of the agent logic itself.
+4. **BPO QA has no frontend screen** — see §15. The agent, its tests, and
+   the NestJS proxy pattern all exist; only the UI consuming it is
+   missing.
+5. **No admin-driven organization onboarding/invite flow** — `/organizations`
+   shows the caller's own org and members only; adding a new member or
+   creating a second organization under a super-admin has no UI or
+   endpoint yet. Deliberately deferred rather than half-built (brief's own
+   "no fabricated data / no fake states" principle applied to feature
+   completeness, not just numbers).
+6. **Employment Act rules still need primary-source legal verification** —
+   carried over from §14, unchanged this phase.
+7. **Per-employee benefits, deductions, and tax residency are still not
+   modeled** on `Employee`/`Contract` — carried over from §14, unchanged.
+8. **No document-rendering layer** — carried over from §14, unchanged.

@@ -9,6 +9,8 @@ import { OrganizationsModule } from "./organizations/organizations.module";
 import { HealthModule } from "./health/health.module";
 import { PayrollModule } from "./payroll/payroll.module";
 import { ContractsModule } from "./contracts/contracts.module";
+import { EmployeesModule } from "./employees/employees.module";
+import { AiModule } from "./ai/ai.module";
 
 @Module({
   imports: [
@@ -24,6 +26,8 @@ import { ContractsModule } from "./contracts/contracts.module";
     HealthModule,
     PayrollModule,
     ContractsModule,
+    EmployeesModule,
+    AiModule,
   ],
   providers: [{ provide: APP_GUARD, useClass: ThrottlerGuard }],
 })

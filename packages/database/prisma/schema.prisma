@@ -54,6 +54,7 @@ model Organization {
   payrollRuns       PayrollRun[]
   payrollRecords    PayrollRecord[]
   aiAuditLogs       AIAuditLog[]
+  aiJobs            AiJob[]
   sessions          Session[]
   authEvents        AuthenticationAuditEvent[]
   complianceEvaluations ComplianceEvaluation[]
@@ -94,6 +95,7 @@ model User {
   approvedPayrollRuns    PayrollRun[]              @relation("PayrollRunApprovedBy")
   requestedAiAuditLogs   AIAuditLog[]              @relation("AIAuditRequestingUser")
   reviewedAiAuditLogs    AIAuditLog[]              @relation("AIAuditReviewer")
+  requestedAiJobs        AiJob[]
   sessions               Session[]
   authEvents             AuthenticationAuditEvent[]
   complianceReviews      ComplianceEvaluation[]     @relation("ComplianceReviewer")
@@ -437,6 +439,7 @@ model Contract {
   employee         Employee?      @relation(fields: [employeeId], references: [id], onDelete: SetNull)
   payrollRecords   PayrollRecord[]
   complianceEvaluations ComplianceEvaluation[]
+  aiJobs           AiJob[]
 
   createdAt        DateTime       @default(now()) @map("created_at")
   updatedAt        DateTime       @updatedAt @map("updated_at")
@@ -820,6 +823,7 @@ model AIAuditLog {
   organization         Organization      @relation(fields: [organizationId], references: [id], onDelete: Restrict)
   requestingUser        User?            @relation("AIAuditRequestingUser", fields: [requestingUserId], references: [id], onDelete: SetNull)
   reviewedBy             User?           @relation("AIAuditReviewer", fields: [reviewedByUserId], references: [id], onDelete: SetNull)
+  aiJob                 AiJob?
 
   createdAt            DateTime          @default(now()) @map("created_at")
 
@@ -828,4 +832,57 @@ model AIAuditLog {
   @@index([requestingUserId])
   @@index([status])
   @@map("ai_audit_logs")
+}
+
+enum AiAgentType {
+  CONTRACT_AUDIT
+  BPO_QA
+}
+
+enum AiJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+}
+
+// A single async unit of AI-agent work (Phase 4, apps/ai). Distinct from
+// AIAuditLog: the audit log is the immutable governance record (hashed
+// input/output refs only, per its own comment above); AiJob is the
+// operational record the frontend polls for status and — once SUCCEEDED —
+// the actual schema-validated structured result the UI renders. Every AiJob
+// that reaches a terminal state has exactly one linked AIAuditLog row,
+// written by the same orchestration call that produced this job's result.
+model AiJob {
+  id                String       @id @default(uuid()) @db.Uuid
+  organizationId    String       @map("organization_id") @db.Uuid
+  requestedByUserId String       @map("requested_by_user_id") @db.Uuid
+
+  agentType         AiAgentType  @map("agent_type")
+  status            AiJobStatus  @default(PENDING)
+  promptVersion     String       @map("prompt_version")
+
+  subjectContractId String?      @map("subject_contract_id") @db.Uuid
+
+  // Populated only once status = SUCCEEDED. Holds the Pydantic-validated
+  // structured agent output (see apps/ai/app/schemas) — never raw model
+  // text, never unvalidated JSON.
+  resultJson        Json?        @map("result_json") @db.JsonB
+  errorSummary      String?      @map("error_summary")
+
+  auditLogId        String?      @unique @map("audit_log_id") @db.Uuid
+
+  organization      Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict)
+  requestedByUser   User         @relation(fields: [requestedByUserId], references: [id], onDelete: Restrict)
+  contract          Contract?    @relation(fields: [subjectContractId], references: [id], onDelete: SetNull)
+  auditLog          AIAuditLog?  @relation(fields: [auditLogId], references: [id], onDelete: SetNull)
+
+  createdAt         DateTime     @default(now()) @map("created_at")
+  updatedAt         DateTime     @updatedAt @map("updated_at")
+  completedAt       DateTime?    @map("completed_at")
+
+  @@index([organizationId])
+  @@index([organizationId, status])
+  @@index([subjectContractId])
+  @@map("ai_jobs")
 }

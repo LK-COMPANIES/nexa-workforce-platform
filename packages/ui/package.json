@@ -2,20 +2,35 @@
   "name": "@nexa/ui",
   "version": "0.1.0",
   "private": true,
-  "description": "Minimal shared UI primitives for apps/web. Extended as the design system grows — kept small deliberately in Phase 1.",
+  "description": "Shared design-system primitives for apps/web — shadcn/ui-pattern components built on Radix + Tailwind + class-variance-authority.",
   "main": "./src/index.ts",
   "types": "./src/index.ts",
   "scripts": {
     "lint": "eslint src --ext .ts,.tsx"
   },
   "peerDependencies": {
-    "react": "^18.3.0"
+    "react": "^18.3.0",
+    "react-dom": "^18.3.0"
   },
   "dependencies": {
-    "clsx": "^2.1.1"
+    "@radix-ui/react-avatar": "^1.1.1",
+    "@radix-ui/react-checkbox": "^1.1.2",
+    "@radix-ui/react-dialog": "^1.1.2",
+    "@radix-ui/react-dropdown-menu": "^2.1.2",
+    "@radix-ui/react-label": "^2.1.0",
+    "@radix-ui/react-progress": "^1.1.0",
+    "@radix-ui/react-select": "^2.1.2",
+    "@radix-ui/react-separator": "^1.1.0",
+    "@radix-ui/react-slot": "^1.1.0",
+    "@radix-ui/react-tabs": "^1.1.1",
+    "class-variance-authority": "^0.7.0",
+    "clsx": "^2.1.1",
+    "lucide-react": "^0.451.0",
+    "tailwind-merge": "^2.5.3"
   },
   "devDependencies": {
     "@types/react": "^18.3.0",
+    "@types/react-dom": "^18.3.0",
     "typescript": "^5.6.0"
   }
 }

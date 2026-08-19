@@ -41,3 +41,9 @@ export const revokeSessionSchema = z.object({
 });
 
 export type RevokeSessionInput = z.infer<typeof revokeSessionSchema>;
+
+export const switchOrganizationSchema = z.object({
+  organizationId: z.string().uuid(),
+});
+
+export type SwitchOrganizationInput = z.infer<typeof switchOrganizationSchema>;

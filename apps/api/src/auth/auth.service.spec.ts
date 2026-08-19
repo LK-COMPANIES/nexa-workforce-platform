@@ -170,3 +170,119 @@ describe("AuthService.refresh — rotation and reuse detection", () => {
     await expect(service.refresh("an-expired-raw-token", {})).rejects.toThrow(/expired/i);
   });
 });
+
+// Phase 4 brief §48/49: "tenant switching valid/invalid/unauthorized" —
+// covers the actual authorization logic behind /auth/switch-organization
+// (apps/web's OrgSwitcher just calls this endpoint; the security decision
+// lives entirely here).
+describe("AuthService.switchOrganization — cross-tenant access control", () => {
+  const currentTenant = { userId: "user-1", organizationId: "org-a", sessionId: "session-1", roleKey: "client_admin", permissions: [], isSuperAdminSession: false };
+
+  it("succeeds for a regular user with an ACTIVE membership in the target organization", async () => {
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "user-1", email: "u@example.test", isActive: true, isPlatformSuperAdmin: false }) },
+      organizationMembership: {
+        findFirst: jest.fn().mockResolvedValue({
+          role: { key: "client_admin", permissions: [{ permission: { key: "organization:read" } }] },
+        }),
+      },
+      authenticationAuditEvent: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const { service, prisma } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    const result = await service.switchOrganization(currentTenant, "org-b", {});
+
+    expect(prisma.runWithTenant).toHaveBeenCalledWith(
+      expect.objectContaining({ tenantId: "org-b", userId: "user-1" }),
+      expect.any(Function),
+    );
+    expect(tx.organizationMembership.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { userId: "user-1", organizationId: "org-b", status: "ACTIVE" } }),
+    );
+    expect(result.tenant.organizationId).toBe("org-b");
+    expect(result.tenant.roleKey).toBe("client_admin");
+    expect(tx.authenticationAuditEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ eventType: "LOGIN_SUCCESS" }) }),
+    );
+  });
+
+  it("rejects a regular user with no membership in the target organization", async () => {
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "user-1", email: "u@example.test", isActive: true, isPlatformSuperAdmin: false }) },
+      organizationMembership: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    const { service, auditService } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    await expect(service.switchOrganization(currentTenant, "org-b", {})).rejects.toThrow(
+      "Not authorized for the requested organization",
+    );
+    expect(auditService.record).toHaveBeenCalledWith(
+      expect.objectContaining({
+        eventType: "TENANT_ACCESS_DENIED",
+        organizationId: "org-b",
+        metadata: expect.objectContaining({ reason: "switch_organization_unauthorized" }),
+      }),
+    );
+  });
+
+  it("rejects a membership that exists but is not ACTIVE (e.g. SUSPENDED)", async () => {
+    // findFirst's own where clause filters status: "ACTIVE" — a suspended
+    // membership simply never matches, so this exercises the same "not
+    // found" rejection path as no membership at all.
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "user-1", email: "u@example.test", isActive: true, isPlatformSuperAdmin: false }) },
+      organizationMembership: { findFirst: jest.fn().mockResolvedValue(null) },
+    };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    await expect(service.switchOrganization(currentTenant, "org-b", {})).rejects.toThrow(UnauthorizedException);
+  });
+
+  it("rejects a deactivated user even if a matching membership would otherwise exist", async () => {
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "user-1", email: "u@example.test", isActive: false, isPlatformSuperAdmin: false }) },
+      organizationMembership: { findFirst: jest.fn() },
+    };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    await expect(service.switchOrganization(currentTenant, "org-b", {})).rejects.toThrow(UnauthorizedException);
+    expect(tx.organizationMembership.findFirst).not.toHaveBeenCalled();
+  });
+
+  it("allows a platform super admin to switch into any existing organization without a membership row, and audits it distinctly", async () => {
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "admin-1", email: "admin@example.test", isActive: true, isPlatformSuperAdmin: true }) },
+      organization: { findUnique: jest.fn().mockResolvedValue({ id: "org-b" }) },
+      role: {
+        findUniqueOrThrow: jest.fn().mockResolvedValue({
+          key: "nexa_super_admin",
+          permissions: [{ permission: { key: "organization:manage_members" } }],
+        }),
+      },
+      authenticationAuditEvent: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const superAdminTenant = { ...currentTenant, userId: "admin-1" };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    const result = await service.switchOrganization(superAdminTenant, "org-b", {});
+
+    expect(result.tenant.organizationId).toBe("org-b");
+    expect(result.tenant.roleKey).toBe("nexa_super_admin");
+    expect(tx.authenticationAuditEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ eventType: "SUPER_ADMIN_ORG_ACCESS" }) }),
+    );
+  });
+
+  it("rejects a platform super admin targeting an organization that does not exist", async () => {
+    const tx = {
+      user: { findUnique: jest.fn().mockResolvedValue({ id: "admin-1", email: "admin@example.test", isActive: true, isPlatformSuperAdmin: true }) },
+      organization: { findUnique: jest.fn().mockResolvedValue(null) },
+    };
+    const superAdminTenant = { ...currentTenant, userId: "admin-1" };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    await expect(service.switchOrganization(superAdminTenant, "nonexistent-org", {})).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
+});
