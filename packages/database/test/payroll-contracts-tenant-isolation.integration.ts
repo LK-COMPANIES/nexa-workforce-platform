@@ -11,6 +11,7 @@
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { runWithTenant } from "../src/tenant-context";
+import { reportUnreachableDatabase } from "./_helpers";
 
 const ownerClient = new PrismaClient({ datasources: { db: { url: process.env.DIRECT_DATABASE_URL } } });
 const appClient = new PrismaClient({ datasources: { db: { url: process.env.DATABASE_URL } } });
@@ -39,8 +40,7 @@ async function canConnect(client: PrismaClient): Promise<boolean> {
 
 async function main(): Promise<void> {
   if (!(await canConnect(ownerClient)) || !(await canConnect(appClient))) {
-    console.log("SKIPPED: no reachable Postgres. Run `docker compose up -d postgres && npm run db:migrate && npm run db:rls` first.");
-    process.exitCode = 0;
+    reportUnreachableDatabase("payroll-contracts-tenant-isolation.integration.ts");
     return;
   }
 
@@ -147,6 +147,14 @@ async function main(): Promise<void> {
       const found = await tx.complianceEvaluation.findUnique({ where: { id: evaluationB.id } });
       assert(found === null, "Tenant A context cannot read Tenant B's compliance evaluation");
     });
+
+    console.log("\nScenario 7 (MANDATORY): Tenant A context cannot DELETE Tenant B's contract.");
+    await runWithTenant(appClient, { tenantId: orgAId }, async (tx) => {
+      const result = await tx.contract.deleteMany({ where: { id: contractB.id } });
+      assert(result.count === 0, "Tenant A context's DELETE against Tenant B's contract affects zero rows");
+    });
+    const contractStillThere = await ownerClient.contract.findUnique({ where: { id: contractB.id } });
+    assert(contractStillThere !== null, "Tenant B's contract still exists after Tenant A's attempted delete");
   } finally {
     console.log("\nCleaning up fixtures...");
     await ownerClient.complianceEvaluation.deleteMany({ where: { organizationId: { in: [orgAId, orgBId] } } });

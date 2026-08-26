@@ -1,0 +1,207 @@
+# =============================================================================
+# Nexa Workforce Solutions — PRODUCTION-SHAPED Docker Compose
+#
+# This is NOT a substitute for enterprise-grade managed infrastructure (see
+# docs/production-readiness.md §"What this file is and isn't"). It is a
+# reference deployment topology suitable for a single-host staging
+# environment or as the starting point for translating into a real
+# container platform (ECS, Cloud Run, a Kubernetes manifest, etc.) — the
+# repository does not assume or require any specific cloud provider.
+#
+# For local development, use `docker-compose.yml` instead (dev servers,
+# hot reload, bind-mounted source). This file builds the real production
+# images (infrastructure/docker/{api,ai,web}.Dockerfile — multi-stage,
+# non-root, no dev servers) and never bind-mounts source.
+#
+# Usage:
+#   cp .env.example .env   # fill in real values — see docs/production-readiness.md
+#   docker compose -f docker-compose.prod.yml up --build
+#
+# Startup order is enforced by dependency conditions, not just ordering:
+#   postgres, redis (healthy)
+#     -> migrate (must EXIT 0 — prisma migrate deploy -> RLS -> seed)
+#       -> api, ai (their own healthchecks gate readiness)
+#         -> web
+# =============================================================================
+
+name: nexa-workforce-platform
+
+networks:
+  # No route to/from outside the Docker host. postgres and redis are on
+  # this network ONLY — nothing external can reach them, and neither is
+  # ever given a `ports:` mapping in this file (brief §8/§13/§14).
+  internal:
+    internal: true
+  # web/api/ai's host/browser-facing side. postgres and redis are
+  # deliberately NOT attached to this network.
+  edge:
+
+volumes:
+  postgres_data:
+  redis_data:
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [internal]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    expose: ["5432"]
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "2", memory: 2G }
+    # Not cap_drop'd: the official postgres entrypoint performs its own
+    # privilege-drop (gosu) and first-run initdb chown, which needs the
+    # capabilities Docker grants by default. Dropping them here risks
+    # exactly the "settings that make startup impossible" outcome the
+    # brief warns against, for a well-audited upstream image that isn't
+    # ours to selectively re-engineer.
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [internal]
+    command: >
+      redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+      ${REDIS_PASSWORD:+--requirepass ${REDIS_PASSWORD}}
+    expose: ["6379"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+  # One-shot: prisma migrate deploy -> RLS -> idempotent seed, then exits.
+  # api/ai are gated on this exiting 0 (service_completed_successfully),
+  # not merely on it having started — a failed migration blocks the whole
+  # stack from coming up instead of racing ahead on a stale schema.
+  migrate:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/migrate.Dockerfile
+    networks: [internal]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      DIRECT_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      NEXA_APP_DB_PASSWORD: ${NEXA_APP_DB_PASSWORD}
+      # Required explicitly — packages/database/prisma/seed.ts refuses to
+      # run under NODE_ENV=production without this, on purpose (brief
+      # §11: no accidental production seeding).
+      SEED_CONFIRM_PRODUCTION: ${SEED_CONFIRM_PRODUCTION:-false}
+      AUTH_BOOTSTRAP_ENABLED: ${AUTH_BOOTSTRAP_ENABLED:-false}
+      NEXA_BOOTSTRAP_ADMIN_EMAIL: ${NEXA_BOOTSTRAP_ADMIN_EMAIL:-}
+      NEXA_BOOTSTRAP_ADMIN_PASSWORD: ${NEXA_BOOTSTRAP_ADMIN_PASSWORD:-}
+    read_only: true
+    tmpfs: ["/tmp"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/api.Dockerfile
+    restart: unless-stopped
+    networks: [internal, edge]
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      DIRECT_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379
+      AI_SERVICE_URL: http://ai:${AI_PORT:-8000}
+      WEB_APP_URL: ${WEB_APP_URL}
+    expose: ["4000"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:4000/health/ready', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+  ai:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/ai.Dockerfile
+    restart: unless-stopped
+    networks: [internal, edge]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      REDIS_URL: redis://${REDIS_PASSWORD:+:${REDIS_PASSWORD}@}redis:6379/1
+    expose: ["8000"]
+    read_only: true
+    tmpfs: ["/tmp"]
+    cap_drop: [ALL]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/health/ready', timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }
+
+  web:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/web.Dockerfile
+      args:
+        # Browser-facing — must be reachable from wherever the browser
+        # actually runs, baked in at build time (see the Dockerfile's own
+        # comment on why this can't be a container-startup env var).
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL}
+    restart: unless-stopped
+    networks: [edge]
+    environment:
+      NODE_ENV: production
+      API_INTERNAL_URL: http://api:4000
+    ports:
+      - "${WEB_PORT:-3000}:3000"
+    read_only: true
+    tmpfs: ["/tmp", "/app/apps/web/.next/cache"]
+    cap_drop: [ALL]
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/api/health', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    deploy:
+      resources:
+        limits: { cpus: "1", memory: 512M }

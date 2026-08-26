@@ -1,0 +1,48 @@
+# Applies to every image built with this repo root as build context
+# (infrastructure/docker/*.Dockerfile). Keeps build context small and,
+# critically, keeps secrets and local-only artifacts out of the build
+# context entirely — a file excluded here can never end up in an image
+# layer, regardless of what a Dockerfile's COPY instructions say.
+
+.git
+.github
+
+node_modules
+**/node_modules
+.next
+**/.next
+dist
+**/dist
+.turbo
+**/.turbo
+*.tsbuildinfo
+
+__pycache__
+**/__pycache__
+*.pyc
+.venv
+**/.venv
+.pytest_cache
+**/.pytest_cache
+*.egg-info
+
+.env
+.env.*
+!.env.example
+
+coverage
+**/coverage
+
+*.log
+npm-debug.log*
+
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Never bake credentials or the deploy history into an image layer.
+.aws
+.ssh
+*.pem
+*.key

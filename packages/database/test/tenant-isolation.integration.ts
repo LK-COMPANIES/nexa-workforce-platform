@@ -19,6 +19,7 @@
 import { randomUUID } from "node:crypto";
 import { PrismaClient } from "@prisma/client";
 import { runWithTenant } from "../src/tenant-context";
+import { reportUnreachableDatabase } from "./_helpers";
 
 const ownerClient = new PrismaClient({
   datasources: { db: { url: process.env.DIRECT_DATABASE_URL } },
@@ -51,11 +52,7 @@ async function canConnect(client: PrismaClient): Promise<boolean> {
 
 async function main(): Promise<void> {
   if (!(await canConnect(ownerClient)) || !(await canConnect(appClient))) {
-    console.log(
-      "SKIPPED: no reachable Postgres (DIRECT_DATABASE_URL / DATABASE_URL). " +
-        "Run `docker compose up -d postgres && npm run db:migrate && npm run db:rls` first.",
-    );
-    process.exitCode = 0;
+    reportUnreachableDatabase("tenant-isolation.integration.ts");
     return;
   }
 
@@ -147,6 +144,29 @@ async function main(): Promise<void> {
       rejectedMalformed = true;
     }
     assert(rejectedMalformed, "runWithTenant throws before querying when tenantId is not a valid UUID");
+
+    console.log("\nScenario 7 (MANDATORY): Tenant A context cannot DELETE Tenant B's employee row.");
+    await runWithTenant(appClient, { tenantId: orgAId }, async (tx) => {
+      const result = await tx.employee.deleteMany({ where: { id: employeeB.id } });
+      assert(result.count === 0, "Tenant A context's DELETE against Tenant B's row affects zero rows");
+    });
+    const stillThere = await ownerClient.employee.findUnique({ where: { id: employeeB.id } });
+    assert(stillThere !== null, "Tenant B's employee row still exists after Tenant A's attempted delete");
+
+    console.log("\nScenario 8 (bidirectional, MANDATORY): Tenant B's own context symmetrically");
+    console.log("  can read its own data and cannot read Tenant A's — isolation is not one-directional.");
+    await runWithTenant(appClient, { tenantId: orgBId }, async (tx) => {
+      const ownRow = await tx.employee.findUnique({ where: { id: employeeB.id } });
+      assert(ownRow !== null && ownRow.id === employeeB.id, "Tenant B context reads its own employee row");
+
+      const otherRow = await tx.employee.findUnique({ where: { id: employeeA.id } });
+      assert(otherRow === null, "Tenant B context cannot read Tenant A's employee row");
+
+      const deleteResult = await tx.employee.deleteMany({ where: { id: employeeA.id } });
+      assert(deleteResult.count === 0, "Tenant B context's DELETE against Tenant A's row affects zero rows");
+    });
+    const employeeAStillThere = await ownerClient.employee.findUnique({ where: { id: employeeA.id } });
+    assert(employeeAStillThere !== null, "Tenant A's employee row still exists after Tenant B's attempted delete");
   } finally {
     console.log("\nCleaning up fixtures...");
     await ownerClient.employee.deleteMany({ where: { organizationId: { in: [orgAId, orgBId] } } });

@@ -1,0 +1,334 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      run_live_ai_smoke_test:
+        description: "Run the live Anthropic smoke test (requires the 'ai-live-smoke-test' environment's ANTHROPIC_API_KEY secret)"
+        type: boolean
+        default: false
+
+# Least privilege by default (brief §32) — individual jobs do not need
+# more than read access to repository contents; none of them publish
+# packages, comment on PRs, or deploy anything.
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20"
+  PYTHON_VERSION: "3.12"
+  # Disposable CI-only credentials for an ephemeral, network-isolated
+  # Postgres container that exists for the lifetime of a single job run —
+  # not a production secret, and never used outside this workflow.
+  CI_POSTGRES_USER: nexa_owner
+  CI_POSTGRES_PASSWORD: ci_owner_password
+  CI_POSTGRES_DB: nexa_workforce_ci
+  CI_NEXA_APP_DB_PASSWORD: ci_app_password
+
+jobs:
+  # ===========================================================================
+  # Static checks — fast, no services required. Everything expensive below
+  # is gated on these passing first.
+  # ===========================================================================
+  lint:
+    name: Lint (turbo run lint)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx turbo run lint
+
+  typecheck:
+    name: Type check (turbo run typecheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      # Every TS workspace has its own `typecheck` script (Phase 5 addition
+      # — none existed before; `build` happened to also type-check, which
+      # is not the same as a fast, non-emitting, dedicated check). See
+      # turbo.json's `typecheck` task and each package.json.
+      - run: npx turbo run typecheck
+        env:
+          # apps/web's next.config.mjs validates env at config-load time
+          # (which `tsc` alone doesn't trigger, but keeping this job's
+          # environment consistent with the build job avoids surprises).
+          NEXT_PUBLIC_API_URL: http://localhost:4000
+          API_INTERNAL_URL: http://localhost:4000
+          DATABASE_URL: postgresql://user:pass@localhost:5432/db
+          DIRECT_DATABASE_URL: postgresql://user:pass@localhost:5432/db
+
+  # ===========================================================================
+  # Unit tests — no live Postgres/Redis; every workspace's own `test`
+  # script (jest) runs against mocked boundaries. packages/database's RLS
+  # proof scripts are NOT run here — they need a real, migrated, RLS-
+  # applied Postgres, so they run in database-rls-tests below instead.
+  # ===========================================================================
+  unit-tests:
+    name: Unit tests (turbo run test)
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx turbo run test
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:4000
+          API_INTERNAL_URL: http://localhost:4000
+
+  # ===========================================================================
+  # Database / RLS tests — a real, disposable Postgres, migrated and RLS-
+  # applied exactly as production would be, running the mandatory tenant-
+  # isolation proofs (packages/database/test/*.integration.ts). A failure
+  # here is release-blocking (brief failure condition #4/#5 and final
+  # principle #13: cross-tenant data exposure is never acceptable).
+  # ===========================================================================
+  database-rls-tests:
+    name: Database + RLS validation
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ${{ env.CI_POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.CI_POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.CI_POSTGRES_DB }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U nexa_owner -d nexa_workforce_ci"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+    env:
+      DIRECT_DATABASE_URL: postgresql://${{ env.CI_POSTGRES_USER }}:${{ env.CI_POSTGRES_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
+      DATABASE_URL: postgresql://nexa_app:${{ env.CI_NEXA_APP_DB_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
+      NEXA_APP_DB_PASSWORD: ${{ env.CI_NEXA_APP_DB_PASSWORD }}
+      CI: "true" # makes the integration scripts FAIL (not skip) if Postgres is unreachable — see test/_helpers.ts
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: prisma migrate deploy (never migrate dev/reset)
+        run: npm run db:deploy
+      - name: Apply RLS policies (idempotent)
+        run: npm run db:rls
+      - name: Seed idempotent reference data
+        run: npm run db:seed
+      - name: Seed is idempotent — run again, must not error or duplicate
+        run: npm run db:seed
+      - name: RLS tenant-isolation proofs (cross-tenant select/update/delete, missing/invalid context)
+        run: npm run test:integration --workspace=@nexa/database
+
+  # ===========================================================================
+  # API end-to-end tests — a real NestJS app instance (supertest) against
+  # real, disposable Postgres + Redis. Covers the brief's mandated critical
+  # path (auth -> RBAC -> employee -> contract -> compliance -> payroll ->
+  # AI audit) and the multi-tenant isolation E2E scenario. See
+  # apps/api/test/*.integration.spec.ts.
+  # ===========================================================================
+  api-e2e-tests:
+    name: API end-to-end tests
+    runs-on: ubuntu-latest
+    needs: [lint, typecheck]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ${{ env.CI_POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.CI_POSTGRES_PASSWORD }}
+          POSTGRES_DB: ${{ env.CI_POSTGRES_DB }}
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd="pg_isready -U nexa_owner -d nexa_workforce_ci"
+          --health-interval=5s --health-timeout=5s --health-retries=10
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=5s --health-retries=10
+    env:
+      DIRECT_DATABASE_URL: postgresql://${{ env.CI_POSTGRES_USER }}:${{ env.CI_POSTGRES_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
+      DATABASE_URL: postgresql://nexa_app:${{ env.CI_NEXA_APP_DB_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
+      NEXA_APP_DB_PASSWORD: ${{ env.CI_NEXA_APP_DB_PASSWORD }}
+      REDIS_URL: redis://localhost:6379
+      JWT_ACCESS_SECRET: ci-test-only-access-secret-at-least-32-characters-long
+      JWT_ACCESS_TTL: 15m
+      JWT_REFRESH_SECRET: ci-test-only-refresh-secret-at-least-32-characters-long
+      JWT_REFRESH_TTL: 7d
+      JWT_ISSUER: nexa-workforce-platform-ci
+      JWT_AUDIENCE: nexa-workforce-platform-ci-clients
+      WEB_APP_URL: http://localhost:3000
+      AI_SERVICE_URL: http://localhost:8000
+      # Not exercised by these tests (no code path uploads to object
+      # storage yet) — required only because apps/api's env schema has no
+      # default for them; dummy values let the app bootstrap.
+      STORAGE_BUCKET: ci-unused-bucket
+      STORAGE_REGION: af-south-1
+      STORAGE_ACCESS_KEY_ID: ci-unused
+      STORAGE_SECRET_ACCESS_KEY: ci-unused
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run db:deploy
+      - run: npm run db:rls
+      - run: npm run db:seed
+      - name: Build workspace dependencies
+        run: npx turbo run build --filter=@nexa/api^...
+      - name: Run API end-to-end tests
+        working-directory: apps/api
+        run: npm run test:integration
+
+  # ===========================================================================
+  # AI service (apps/ai) — independent Python stack. Deterministic tests
+  # only: the Anthropic SDK is mocked at the service boundary (see
+  # app/tests/test_orchestration_client.py) — no live API key, no network
+  # call to Anthropic, ever required for ordinary PR CI (brief §29,
+  # final principle #8). No Postgres/Redis needed either — every DB/Redis
+  # boundary in these tests is faked (see app/tests/conftest.py).
+  # ===========================================================================
+  ai-tests:
+    name: AI service (ruff + pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/ai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: apps/ai/requirements-dev.txt
+      - run: pip install -r requirements-dev.txt
+      - name: ruff lint
+        run: ruff check .
+      - name: ruff format check
+        run: ruff format --check .
+      - name: pytest (excludes the live-smoke marker — no Anthropic key in ordinary CI)
+        run: pytest -v -m "not live_smoke"
+
+  # ===========================================================================
+  # Build — every workspace's production build (next build / nest build /
+  # tsc). Gated on tests passing: no point spending build minutes on code
+  # that's already known to be broken.
+  # ===========================================================================
+  build:
+    name: Build (turbo run build)
+    runs-on: ubuntu-latest
+    needs: [unit-tests, database-rls-tests, api-e2e-tests, ai-tests]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npx turbo run build
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:4000
+          API_INTERNAL_URL: http://localhost:4000
+          DATABASE_URL: postgresql://user:pass@localhost:5432/db
+          DIRECT_DATABASE_URL: postgresql://user:pass@localhost:5432/db
+
+  # ===========================================================================
+  # Container build validation — proves every production image actually
+  # builds. Deliberately NOT a deploy step (brief §31/§33): no image is
+  # pushed anywhere, no registry credentials are used. A separate CD
+  # workflow, added once an actual deployment target is chosen, would own
+  # pushing/deploying — this repository does not assume one.
+  # ===========================================================================
+  docker-build-validation:
+    name: Docker image builds (web / api / ai / migrate)
+    runs-on: ubuntu-latest
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: web
+            dockerfile: infrastructure/docker/web.Dockerfile
+          - name: api
+            dockerfile: infrastructure/docker/api.Dockerfile
+          - name: ai
+            dockerfile: infrastructure/docker/ai.Dockerfile
+          - name: migrate
+            dockerfile: infrastructure/docker/migrate.Dockerfile
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build ${{ matrix.name }} image (no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          build-args: |
+            NEXT_PUBLIC_API_URL=https://api.example.invalid
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+  # ===========================================================================
+  # Security checks — independent lane, runs immediately (no needs:).
+  # ===========================================================================
+  security-checks:
+    name: Secret scanning
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # Pinned to a specific release tag, not a floating major-version tag
+      # (brief §32: pin critical third-party actions to trusted versions).
+      - name: gitleaks
+        uses: gitleaks/gitleaks-action@v2.3.9
+        env:
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+
+  # ===========================================================================
+  # Optional live AI smoke test — the ONLY job in this workflow that can
+  # touch the real Anthropic API, and only when explicitly requested via
+  # workflow_dispatch AND the `ai-live-smoke-test` environment's secret is
+  # configured (GitHub environment protection rules can additionally
+  # require manual approval). Never runs on pull_request or push — brief
+  # §29/final principle #8.
+  # ===========================================================================
+  ai-live-smoke-test:
+    name: Live AI smoke test (manual only)
+    if: github.event_name == 'workflow_dispatch' && inputs.run_live_ai_smoke_test
+    runs-on: ubuntu-latest
+    environment: ai-live-smoke-test
+    defaults:
+      run:
+        working-directory: apps/ai
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements-dev.txt
+      - name: Live Anthropic call smoke test
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: pytest -v -m live_smoke

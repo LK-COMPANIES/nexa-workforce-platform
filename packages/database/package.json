@@ -7,13 +7,14 @@
   "types": "./dist/index.d.ts",
   "scripts": {
     "build": "prisma generate && tsc -p tsconfig.json",
+    "typecheck": "prisma generate && tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "dev": "prisma generate && tsc -p tsconfig.json --watch --preserveWatchOutput",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
     "db:rls": "tsx scripts/apply-rls.ts",
     "db:seed": "tsx prisma/seed.ts",
-    "test:integration": "tsx test/tenant-isolation.integration.ts && tsx test/payroll-contracts-tenant-isolation.integration.ts",
+    "test:integration": "tsx test/tenant-isolation.integration.ts && tsx test/payroll-contracts-tenant-isolation.integration.ts && tsx test/ai-jobs-tenant-isolation.integration.ts",
     "lint": "eslint src --ext .ts"
   },
   "dependencies": {

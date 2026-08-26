@@ -1,0 +1,19 @@
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+
+[tool.ruff.lint]
+# A deliberately modest baseline (brief §22: "do not add unnecessary
+# tooling solely for appearance") — pyflakes (unused imports/vars, actual
+# bugs), pycodestyle errors, and import sorting. Not the full "ALL" rule
+# set: this codebase has never been run through ruff before (no Python
+# interpreter was available while writing it — see docs/production-
+# readiness.md), so starting from a narrow, high-signal rule set avoids
+# CI failing on a wall of unverified style nitpicks on day one.
+select = ["E", "F", "I"]
+ignore = [
+  "E501", # line-length is a formatter concern (ruff format), not a lint failure
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app"]

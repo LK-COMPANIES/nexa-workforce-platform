@@ -1,4 +1,4 @@
-# Nexa Workforce Solutions — Architecture (Phase 1 + Phase 2 + Phase 3 + Phase 4)
+# Nexa Workforce Solutions — Architecture (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5)
 
 ## 1. Repository layout
 
@@ -610,3 +610,35 @@ manually clicked through.
 7. **Per-employee benefits, deductions, and tax residency are still not
    modeled** on `Employee`/`Contract` — carried over from §14, unchanged.
 8. **No document-rendering layer** — carried over from §14, unchanged.
+
+## 17. Phase 5 — production readiness, deployment, CI/CD, end-to-end integration
+
+Full detail lives in two new dedicated documents rather than duplicated here: [`docs/production-readiness.md`](production-readiness.md) (infrastructure/security/application/testing/operations checklist, every item with a real status) and [`docs/compliance-readiness.md`](compliance-readiness.md) (Employment Act 2007, Data Protection Act 2019, and statutory payroll matrices — an engineering readiness document, not legal advice or certification).
+
+### What Phase 5 added
+
+- **Production Docker**: multi-stage, non-root `infrastructure/docker/{web,api,ai,migrate}.Dockerfile`, turborepo-pruned for web/api/migrate, a virtualenv-isolated build for ai. The pre-existing dev-oriented Dockerfiles were renamed to `*.dev.Dockerfile`, not replaced — local `docker compose up` behavior is unchanged. `docker-compose.prod.yml` is new: internal/edge network separation (Postgres/Redis never on a network with external routing, never given a `ports:` mapping), `cap_drop`, `read_only` root filesystems with narrow `tmpfs` exceptions, resource limits, and a one-shot `migrate` service (`prisma migrate deploy` → RLS → seed) gated via `service_completed_successfully` — the same `migrate` service was also added to the dev compose file, fixing a real pre-existing gap where the `nexa_app` role had to be provisioned by hand on first run.
+- **CI**: `.github/workflows/ci.yml` — lint, typecheck (new `typecheck` script added to every TS workspace; none existed before), unit tests, a real disposable-Postgres RLS-validation job, a real disposable-Postgres-plus-Redis API end-to-end job, an independent Python/ruff/pytest job, a build job, a container-build-validation matrix (build-only, never pushes), gitleaks secret scanning, and an optional manually-triggered live-Anthropic smoke test that never runs on ordinary PRs.
+- **RLS tests strengthened**: added mandatory cross-tenant DELETE scenarios and full bidirectional (Tenant A ↔ Tenant B, not just A→B) coverage to the existing Phase 2/3 integration scripts, plus net-new coverage for the Phase 4 `ai_jobs` table (previously untested). The scripts' "skip if no DB" behavior now becomes a hard failure when `CI=true` — a misconfigured CI environment can no longer silently report a passing suite that never ran.
+- **API end-to-end tests** (new): `apps/api/test/{critical-path,tenant-isolation}.integration.spec.ts` boot the real `AppModule` via `Test.createTestingModule` and drive it with `supertest` — register → login → RBAC → employee → contract → deterministic compliance → payroll (verified against the same engine's own calculator-preview output, not re-derived math) → AI audit (against a minimal fake HTTP stand-in for `apps/ai`, proving the real `apps/api`↔`apps/ai` contract without needing Python or a live Anthropic key) → audit log, plus the mandatory two-tenant IDOR/spoofing scenario.
+- **`POST /employees` added** — previously read-only (Phase 4 exposed only `GET /employees` for the dashboard). Added because the E2E critical path requires it and no UI/API path existed yet; the validation schema and `employee:create` permission already existed, unused, since an earlier phase.
+
+### A critical bug found by this phase's own E2E tests
+
+Booting the real Nest DI container (`Test.createTestingModule({ imports: [AppModule] }).compile()`) — which nothing in Phases 1–4 had ever actually done, since every prior test constructed guards directly with `new TenantContextGuard(mockPrisma, mockAuditService)`, bypassing Nest's DI system — immediately failed with `Nest can't resolve dependencies of the TenantContextGuard (PrismaService, ?)`. Root cause: `@UseGuards(TenantContextGuard)` / `@UseGuards(PermissionsGuard)` are resolved by Nest within the DI scope of whichever module declares the controller using them, not just wherever the guard happens to be provided elsewhere — and neither `TenancyModule` nor `AuthorizationModule` re-exported `AuthAuditModule` (only the guard itself), so `AuthAuditService` was invisible to every feature module (`OrganizationsModule`, `ContractsModule`, `EmployeesModule`, `PayrollModule`, `AiModule`) except `AuthModule`, which happened to import `AuthAuditModule` directly for its own reasons. **In practice this meant the entire API would have failed to even start in any real deployment** — not a silent security bypass (DI resolution fails at bootstrap, before the process ever listens on a port), but a total, immediate, unmissable failure that unit tests structurally could not catch and that this environment's lack of a live database had prevented from surfacing for four phases. Fixed by adding `AuthAuditModule` to both modules' `exports` arrays; verified by re-running the same DI boot, which now progresses correctly through every guard and fails only at the expected, unrelated point (no live Postgres in this authoring environment).
+
+### Environment constraints (stated once, in full, in `docs/production-readiness.md`)
+
+No Docker CLI, no Python interpreter, no live Postgres/Redis, and no GitHub Actions execution were available while authoring this phase. Every claim above that depends on one of those is marked accordingly in `docs/production-readiness.md` rather than asserted as verified — the one exception is the DI bug above, which a real (if ultimately DB-less) Nest boot in this environment did directly prove and disprove.
+
+## 18. Architectural risks to resolve before Phase 6
+
+1. **None of Phase 5's Docker/CI infrastructure has ever executed** — see §17's environment-constraints note. This is the single highest-priority item: run `docker compose -f docker-compose.prod.yml up --build`, push a branch to trigger `.github/workflows/ci.yml`, and run `pytest` inside `apps/ai`, before trusting any of it.
+2. **`apps/ai`'s test suite and the Phase 2/3/5 RLS integration tests have still never executed** — carried over, now compounding across three phases of "written, not run."
+3. **No structured logging, request-ID propagation, or wired-up monitoring/error-tracking** — `.env.example`'s `OTEL_EXPORTER_OTLP_ENDPOINT` is a placeholder, not a working integration. See `docs/production-readiness.md`'s Operations section.
+4. **No backup/restore/disaster-recovery automation exists** — by design, not oversight: no specific production infrastructure is assumed yet (brief §33), so there is nothing concrete to automate against. This becomes real work once a deployment target is chosen.
+5. **No data-subject rights (access/correction/erasure) API, no retention/deletion policy, and the controller/processor determination for DPA 2019 purposes is unresolved** — see `docs/compliance-readiness.md` §2. These are legal/product gaps, not infrastructure gaps, and the highest-risk item in that document (cross-border data transfer to Anthropic) needs legal sign-off specifically, not more code.
+6. **BPO QA still has no frontend screen** — carried over from §16.
+7. **No admin-driven organization onboarding/invite flow** — carried over from §16.
+8. **Employment Act rules and all four statutory payroll rates still need primary-source legal verification** — carried over from §14/§16, now with a full matrix in `docs/compliance-readiness.md` making the specific gaps explicit rather than a general caveat.
+9. **Per-employee benefits, deductions, and tax residency are still not modeled**; **no document-rendering layer exists** — both carried over unchanged.

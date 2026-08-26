@@ -1,5 +1,12 @@
 name: nexa-workforce-platform
 
+# LOCAL DEVELOPMENT compose file: dev servers with hot reload, bind-mounted
+# source, postgres/redis published to the host for direct developer access
+# (e.g. `psql`, `redis-cli` from the host machine) — a normal, low-risk
+# local-dev convenience, not a production posture. See docker-compose.prod.yml
+# for the hardened production topology (no published DB/Redis ports,
+# non-root multi-stage images, no bind mounts, cap_drop, resource limits).
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -31,15 +38,29 @@ services:
       timeout: 5s
       retries: 10
 
-  # NestJS transactional API. NOTE: on a first-ever `docker compose up`, this
-  # service will fail to connect until the `nexa_app` database role exists —
-  # see the bootstrap sequence in docs/architecture.md
-  # (db:migrate → db:rls → db:seed must run once against postgres before
-  # api/ai can authenticate as nexa_app).
+  # One-shot: prisma migrate deploy -> RLS -> idempotent seed, then exits.
+  # Fixes what used to be a manual step on first-ever `docker compose up`
+  # (db:migrate/db:rls/db:seed had to be run by hand before api/ai could
+  # authenticate as nexa_app) — api now waits for this to exit 0 instead.
+  migrate:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/migrate.Dockerfile
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      DIRECT_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
+      NEXA_APP_DB_PASSWORD: ${NEXA_APP_DB_PASSWORD}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # NestJS transactional API.
   api:
     build:
       context: .
-      dockerfile: infrastructure/docker/api.Dockerfile
+      dockerfile: infrastructure/docker/api.dev.Dockerfile
     env_file: .env
     environment:
       DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
@@ -52,8 +73,8 @@ services:
       - .:/workspace
       - api_node_modules:/workspace/node_modules
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
       redis:
         condition: service_healthy
     healthcheck:
@@ -71,7 +92,7 @@ services:
   ai:
     build:
       context: .
-      dockerfile: infrastructure/docker/ai.Dockerfile
+      dockerfile: infrastructure/docker/ai.dev.Dockerfile
     env_file: .env
     environment:
       DATABASE_URL: postgresql://nexa_app:${NEXA_APP_DB_PASSWORD}@postgres:5432/${POSTGRES_DB}?schema=public
@@ -80,8 +101,8 @@ services:
     volumes:
       - ./apps/ai:/workspace/apps/ai
     depends_on:
-      postgres:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s
@@ -91,7 +112,7 @@ services:
   web:
     build:
       context: .
-      dockerfile: infrastructure/docker/web.Dockerfile
+      dockerfile: infrastructure/docker/web.dev.Dockerfile
     env_file: .env
     environment:
       # Browser-facing (inlined into the client bundle): must be reachable
