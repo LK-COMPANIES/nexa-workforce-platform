@@ -286,3 +286,186 @@ describe("AuthService.switchOrganization — cross-tenant access control", () =>
     );
   });
 });
+
+// Phase 6: completes the invite flow OrganizationMembership was already
+// designed for (status has defaulted to INVITED since Phase 1, unused
+// until now).
+describe("AuthService.inviteMember / acceptInvite", () => {
+  const adminTenant = {
+    userId: "admin-1",
+    organizationId: "org-a",
+    sessionId: "session-1",
+    roleKey: "client_admin",
+    permissions: [],
+    isSuperAdminSession: false,
+  };
+
+  it("creates a new user and an INVITED membership when the email has no existing account", async () => {
+    const tx = {
+      user: { create: jest.fn().mockResolvedValue({}) },
+      organizationMembership: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({ id: "membership-1" }),
+      },
+      role: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "role-hr", key: "hr_manager" }) },
+      authenticationAuditEvent: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    const result = await service.inviteMember(
+      adminTenant,
+      { email: "new-hire@example.test", firstName: "New", lastName: "Hire", roleKey: "hr_manager" },
+      {},
+    );
+
+    expect(tx.user.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ email: "new-hire@example.test" }) }),
+    );
+    expect(tx.organizationMembership.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "INVITED",
+          roleId: "role-hr",
+          inviteTokenHash: expect.any(String),
+        }),
+      }),
+    );
+    expect(tx.authenticationAuditEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ eventType: "MEMBER_INVITED", actingUserId: "admin-1" }) }),
+    );
+    expect(result.inviteToken).toEqual(expect.any(String));
+    expect(result.email).toBe("new-hire@example.test");
+  });
+
+  it("reuses an existing user account instead of creating a duplicate when the email already exists", async () => {
+    const tx = {
+      user: { create: jest.fn() },
+      organizationMembership: {
+        findUnique: jest.fn().mockResolvedValue(null),
+        create: jest.fn().mockResolvedValue({ id: "membership-2" }),
+      },
+      role: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "role-hr", key: "hr_manager" }) },
+      authenticationAuditEvent: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const existingUserRow = {
+      id: "existing-user-1",
+      email: "already-has-account@example.test",
+      password_hash: "irrelevant",
+      is_active: true,
+      is_platform_super_admin: false,
+    };
+    const { service } = makeAuthService({ queryRawResult: [existingUserRow], txImpl: tx });
+
+    await service.inviteMember(
+      adminTenant,
+      { email: "already-has-account@example.test", firstName: "Existing", lastName: "User", roleKey: "hr_manager" },
+      {},
+    );
+
+    expect(tx.user.create).not.toHaveBeenCalled();
+    expect(tx.organizationMembership.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ userId: "existing-user-1" }) }),
+    );
+  });
+
+  it("rejects inviting someone who is already an ACTIVE member of the organization", async () => {
+    const tx = {
+      user: { create: jest.fn() },
+      organizationMembership: {
+        findUnique: jest.fn().mockResolvedValue({ status: "ACTIVE" }),
+        create: jest.fn(),
+      },
+      role: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "role-hr" }) },
+    };
+    const existingUserRow = { id: "existing-user-1", email: "x@example.test", password_hash: "x", is_active: true, is_platform_super_admin: false };
+    const { service } = makeAuthService({ queryRawResult: [existingUserRow], txImpl: tx });
+
+    await expect(
+      service.inviteMember(adminTenant, { email: "x@example.test", firstName: "A", lastName: "B", roleKey: "hr_manager" }, {}),
+    ).rejects.toThrow(/already a member/i);
+    expect(tx.organizationMembership.create).not.toHaveBeenCalled();
+  });
+
+  it("rejects re-inviting someone who already has a pending invite", async () => {
+    const tx = {
+      user: { create: jest.fn() },
+      organizationMembership: {
+        findUnique: jest.fn().mockResolvedValue({ status: "INVITED" }),
+        create: jest.fn(),
+      },
+      role: { findUniqueOrThrow: jest.fn().mockResolvedValue({ id: "role-hr" }) },
+    };
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: tx });
+
+    await expect(
+      service.inviteMember(adminTenant, { email: "pending@example.test", firstName: "A", lastName: "B", roleKey: "hr_manager" }, {}),
+    ).rejects.toThrow(/pending invite/i);
+  });
+
+  it("acceptInvite activates a valid, unexpired invite and sets the new password", async () => {
+    const tx = {
+      user: { update: jest.fn().mockResolvedValue({}) },
+      organizationMembership: { update: jest.fn().mockResolvedValue({}) },
+      authenticationAuditEvent: { create: jest.fn().mockResolvedValue({}) },
+    };
+    const inviteRow = {
+      membership_id: "membership-1",
+      organization_id: "org-a",
+      user_id: "invited-user-1",
+      role_id: "role-hr",
+      status: "INVITED",
+      invite_token_expires_at: new Date(Date.now() + 60_000),
+    };
+    const { service } = makeAuthService({ queryRawResult: [inviteRow], txImpl: tx });
+
+    const result = await service.acceptInvite({ token: "raw-invite-token", password: "a-brand-new-secure-password-123" }, {});
+
+    expect(tx.user.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: "invited-user-1" } }),
+    );
+    expect(tx.organizationMembership.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: "membership-1" },
+        data: expect.objectContaining({ status: "ACTIVE", inviteTokenHash: null }),
+      }),
+    );
+    expect(result.organizationId).toBe("org-a");
+  });
+
+  it("rejects an unknown invite token", async () => {
+    const { service } = makeAuthService({ queryRawResult: [], txImpl: {} });
+    await expect(service.acceptInvite({ token: "not-a-real-token", password: "a-brand-new-secure-password-123" }, {})).rejects.toThrow(
+      UnauthorizedException,
+    );
+  });
+
+  it("rejects an expired invite token", async () => {
+    const inviteRow = {
+      membership_id: "membership-1",
+      organization_id: "org-a",
+      user_id: "invited-user-1",
+      role_id: "role-hr",
+      status: "INVITED",
+      invite_token_expires_at: new Date(Date.now() - 60_000),
+    };
+    const { service } = makeAuthService({ queryRawResult: [inviteRow], txImpl: {} });
+    await expect(
+      service.acceptInvite({ token: "expired-token", password: "a-brand-new-secure-password-123" }, {}),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+
+  it("rejects a token whose invite was already accepted (status no longer INVITED)", async () => {
+    const inviteRow = {
+      membership_id: "membership-1",
+      organization_id: "org-a",
+      user_id: "invited-user-1",
+      role_id: "role-hr",
+      status: "ACTIVE",
+      invite_token_expires_at: new Date(Date.now() + 60_000),
+    };
+    const { service } = makeAuthService({ queryRawResult: [inviteRow], txImpl: {} });
+    await expect(
+      service.acceptInvite({ token: "already-used-token", password: "a-brand-new-secure-password-123" }, {}),
+    ).rejects.toThrow(UnauthorizedException);
+  });
+});

@@ -12,6 +12,11 @@ import { SessionService } from "./session.service";
   imports: [TenancyModule, AuthorizationModule, AuthAuditModule],
   controllers: [AuthController],
   providers: [AuthService, JwtAuthGuard, SessionService, RefreshTokenService],
-  exports: [JwtAuthGuard],
+  // AuthService exported so OrganizationsModule can inject it for the
+  // member-invite endpoint (Phase 6) — invite/accept-invite are identity-
+  // creation operations with the exact same runWithTenant/hashPassword
+  // patterns as register()/switchOrganization() above, so they live here
+  // rather than duplicating that logic in a new service.
+  exports: [JwtAuthGuard, AuthService],
 })
 export class AuthModule {}

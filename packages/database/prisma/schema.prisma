@@ -164,6 +164,16 @@ model OrganizationMembership {
   invitedAt      DateTime?         @map("invited_at")
   joinedAt       DateTime?         @map("joined_at")
 
+  // Phase 6: completes the invite flow this table was already designed
+  // for (status has defaulted to INVITED since Phase 1, unused until now
+  // — every membership was previously created with status forced to
+  // ACTIVE in application code). Same raw/hash pattern as RefreshToken
+  // (packages/auth/src/refresh-token.ts) — the raw token is returned to
+  // the inviting admin exactly once and never stored; only its SHA-256
+  // hash lives here. Cleared once the invite is accepted or expires.
+  inviteTokenHash      String?   @map("invite_token_hash")
+  inviteTokenExpiresAt DateTime? @map("invite_token_expires_at")
+
   user           User              @relation(fields: [userId], references: [id], onDelete: Cascade)
   organization   Organization      @relation(fields: [organizationId], references: [id], onDelete: Cascade)
   role           Role              @relation(fields: [roleId], references: [id], onDelete: Restrict)
@@ -282,6 +292,10 @@ enum AuthEventType {
   // A platform-super-admin established context in an organization they hold
   // no membership in. Always paired with Session.isSuperAdminSession = true.
   SUPER_ADMIN_ORG_ACCESS
+  // Phase 6: the invite-based onboarding flow (completes the INVITED
+  // MembershipStatus that existed, unused, since Phase 1).
+  MEMBER_INVITED
+  INVITE_ACCEPTED
 }
 
 // Security-investigation trail for the authentication/authorization

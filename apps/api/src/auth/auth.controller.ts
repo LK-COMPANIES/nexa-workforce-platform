@@ -1,11 +1,13 @@
 import { Body, Controller, Get, HttpCode, Post, Req, UseGuards } from "@nestjs/common";
 import type { Request } from "express";
 import {
+  acceptInviteSchema,
   loginSchema,
   refreshTokenSchema,
   registerClientOrganizationSchema,
   revokeSessionSchema,
   switchOrganizationSchema,
+  type AcceptInviteInput,
   type LoginInput,
   type RefreshTokenInput,
   type RegisterClientOrganizationInput,
@@ -38,6 +40,14 @@ export class AuthController {
   @HttpCode(200)
   login(@Body(new ZodValidationPipe(loginSchema)) body: LoginInput, @Req() request: Request) {
     return this.authService.login(body, extractRequestMetadata(request));
+  }
+
+  // Public — the invitee has no session yet. See
+  // AuthService.acceptInvite/OrganizationsController.inviteMember.
+  @Post("accept-invite")
+  @HttpCode(200)
+  acceptInvite(@Body(new ZodValidationPipe(acceptInviteSchema)) body: AcceptInviteInput, @Req() request: Request) {
+    return this.authService.acceptInvite(body, extractRequestMetadata(request));
   }
 
   @Post("refresh")

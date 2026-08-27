@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
+import { ConflictException, Injectable, NotFoundException, UnauthorizedException } from "@nestjs/common";
 import {
   assertPasswordPolicy,
+  generateRefreshToken,
   hashPassword,
   hashRefreshToken,
   signAccessToken,
@@ -9,6 +10,8 @@ import {
 } from "@nexa/auth";
 import type { PermissionKey } from "@nexa/types";
 import type {
+  AcceptInviteInput,
+  InviteMemberInput,
   LoginInput,
   RegisterClientOrganizationInput,
 } from "@nexa/validation";
@@ -52,6 +55,15 @@ interface RefreshLookupRow {
   is_super_admin_session: boolean;
   user_id: string;
   organization_id: string;
+}
+
+interface InviteLookupRow {
+  membership_id: string;
+  organization_id: string;
+  user_id: string;
+  role_id: string;
+  status: string;
+  invite_token_expires_at: Date | null;
 }
 
 function isUniqueConstraintViolation(error: unknown): boolean {
@@ -658,5 +670,148 @@ export class AuthService {
         };
       },
     );
+  }
+
+  // -----------------------------------------------------------------------
+  // Member invitation (Phase 6) — completes the invite flow
+  // OrganizationMembership was already designed for (status has defaulted
+  // to INVITED since Phase 1; every membership was previously created with
+  // status forced to ACTIVE in code, in register()/switchOrganization()
+  // above, leaving INVITED entirely unused until now).
+  //
+  // RLS note: `users`' WITH CHECK requires id = app.current_user_id, so an
+  // authenticated admin's own tenant transaction cannot INSERT a *different*
+  // user's row. This mirrors register()'s own solution: when the invited
+  // email has no existing account, the transaction's userId is set to the
+  // new user's own freshly-generated id (not the admin's), which is enough
+  // to satisfy that check — organization_memberships and
+  // authentication_audit_events' RLS policies only ever check
+  // organization_id, never current_user_id, so writing them for a
+  // different user (the invitee) than the tenant context's nominal "user"
+  // works correctly either way.
+  // ---------------------------------------------------------------------------
+  async inviteMember(tenant: RequestTenantContext, input: InviteMemberInput, meta: RequestMetadata) {
+    const existingRows = await this.prisma.client.$queryRaw<AuthLookupRow[]>`
+      SELECT * FROM auth_lookup_user_by_email(${input.email})
+    `;
+    const existingUser = existingRows[0];
+    const invitedUserId = existingUser?.id ?? randomUUID();
+
+    const rawInviteToken = generateRefreshToken(); // generic opaque-token utility, reused verbatim
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+    let result: { membershipId: string };
+    try {
+      result = await this.prisma.runWithTenant(
+        { tenantId: tenant.organizationId, userId: invitedUserId },
+        async (tx) => {
+          if (!existingUser) {
+            await tx.user.create({
+              data: {
+                id: invitedUserId,
+                email: input.email,
+                // Unusable until acceptInvite() sets a real password — a
+                // random Argon2id hash of a value that is never returned
+                // to anyone, never logged, and discarded immediately.
+                passwordHash: await hashPassword(randomUUID() + randomUUID()),
+                firstName: input.firstName,
+                lastName: input.lastName,
+              },
+            });
+          }
+
+          const existingMembership = await tx.organizationMembership.findUnique({
+            where: { userId_organizationId: { userId: invitedUserId, organizationId: tenant.organizationId } },
+          });
+          if (existingMembership) {
+            throw new ConflictException(
+              existingMembership.status === "ACTIVE"
+                ? "This person is already a member of your organization."
+                : "This person already has a pending invite to your organization.",
+            );
+          }
+
+          const role = await tx.role.findUniqueOrThrow({ where: { key: input.roleKey } });
+
+          const membership = await tx.organizationMembership.create({
+            data: {
+              userId: invitedUserId,
+              organizationId: tenant.organizationId,
+              roleId: role.id,
+              status: "INVITED",
+              invitedAt: new Date(),
+              inviteTokenHash: rawInviteToken.hash,
+              inviteTokenExpiresAt: expiresAt,
+            },
+          });
+
+          await tx.authenticationAuditEvent.create({
+            data: {
+              organizationId: tenant.organizationId,
+              actingUserId: tenant.userId,
+              eventType: "MEMBER_INVITED",
+              ipAddress: meta.ip,
+              userAgent: meta.userAgent?.slice(0, 512),
+              metadata: { invitedEmail: input.email, roleKey: input.roleKey },
+            },
+          });
+
+          return { membershipId: membership.id };
+        },
+      );
+    } catch (error) {
+      if (isUniqueConstraintViolation(error)) {
+        throw new ConflictException("This person already has a pending invite to your organization.");
+      }
+      throw error;
+    }
+
+    return {
+      membershipId: result.membershipId,
+      email: input.email,
+      roleKey: input.roleKey,
+      // Returned exactly once — never persisted, never logged (brief:
+      // same discipline as RefreshToken's own raw value). The inviting
+      // admin is responsible for delivering this to the invitee out of
+      // band; no email-sending infrastructure exists in this system.
+      inviteToken: rawInviteToken.raw,
+      expiresAt,
+    };
+  }
+
+  async acceptInvite(input: AcceptInviteInput, meta: RequestMetadata) {
+    const genericFailure = () => new UnauthorizedException("This invite link is invalid or has expired.");
+    assertPasswordPolicy(input.password);
+
+    const tokenHash = hashRefreshToken(input.token);
+    const rows = await this.prisma.client.$queryRaw<InviteLookupRow[]>`
+      SELECT * FROM auth_lookup_membership_by_invite_token(${tokenHash})
+    `;
+    const row = rows[0];
+
+    if (!row || row.status !== "INVITED" || !row.invite_token_expires_at || row.invite_token_expires_at.getTime() <= Date.now()) {
+      throw genericFailure();
+    }
+
+    const passwordHash = await hashPassword(input.password);
+
+    await this.prisma.runWithTenant({ tenantId: row.organization_id, userId: row.user_id }, async (tx) => {
+      await tx.user.update({ where: { id: row.user_id }, data: { passwordHash, isActive: true } });
+      await tx.organizationMembership.update({
+        where: { id: row.membership_id },
+        data: { status: "ACTIVE", joinedAt: new Date(), inviteTokenHash: null, inviteTokenExpiresAt: null },
+      });
+      await tx.authenticationAuditEvent.create({
+        data: {
+          organizationId: row.organization_id,
+          actingUserId: row.user_id,
+          eventType: "INVITE_ACCEPTED",
+          ipAddress: meta.ip,
+          userAgent: meta.userAgent?.slice(0, 512),
+        },
+      });
+    });
+
+    return { organizationId: row.organization_id };
   }
 }

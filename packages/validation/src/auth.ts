@@ -47,3 +47,26 @@ export const switchOrganizationSchema = z.object({
 });
 
 export type SwitchOrganizationInput = z.infer<typeof switchOrganizationSchema>;
+
+// Deliberately excludes "nexa_super_admin" — an organization admin inviting
+// a new member into THEIR org must never be able to grant a platform-wide
+// role that way (that would be a privilege-escalation path, not an
+// onboarding feature). See apps/api/src/organizations/organizations.
+// service.ts's own re-check of this at the service layer, not just here.
+export const INVITABLE_ROLE_KEYS = ["client_admin", "hr_manager", "bpo_supervisor", "bpo_agent", "employee"] as const;
+
+export const inviteMemberSchema = z.object({
+  email: z.string().email(),
+  firstName: z.string().min(1).max(100),
+  lastName: z.string().min(1).max(100),
+  roleKey: z.enum(INVITABLE_ROLE_KEYS),
+});
+
+export type InviteMemberInput = z.infer<typeof inviteMemberSchema>;
+
+export const acceptInviteSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(12).max(128, "Password must be between 12 and 128 characters"),
+});
+
+export type AcceptInviteInput = z.infer<typeof acceptInviteSchema>;
