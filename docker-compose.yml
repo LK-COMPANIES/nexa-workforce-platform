@@ -129,9 +129,25 @@ services:
     depends_on:
       - api
 
+  # Public marketing site — deliberately independent of every other
+  # service here: no database, no auth, no dependency on api/ai. See
+  # infrastructure/docker/website.dev.Dockerfile.
+  website:
+    build:
+      context: .
+      dockerfile: infrastructure/docker/website.dev.Dockerfile
+    ports:
+      - "${WEBSITE_PORT:-3100}:3100"
+    volumes:
+      - .:/workspace
+      - website_node_modules:/workspace/node_modules
+      - website_next_cache:/workspace/apps/website/.next
+
 volumes:
   postgres_data:
   redis_data:
   api_node_modules:
   web_node_modules:
   web_next_cache:
+  website_node_modules:
+  website_next_cache:

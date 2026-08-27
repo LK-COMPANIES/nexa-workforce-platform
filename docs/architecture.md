@@ -16,7 +16,12 @@ nexa-workforce-platform/
 │   │       ├── contracts/     contract CRUD + compliance/ (deterministic Employment Act validator)
 │   │       ├── organizations/ thin proof-of-pattern endpoint
 │   │       └── prisma/, redis/, config/, health/, common/
-│   └── ai/                 FastAPI — AI orchestration + AIAuditLog governance
+│   ├── ai/                 FastAPI — AI orchestration + AIAuditLog governance
+│   └── website/            Next.js 14 — PUBLIC marketing site (nexaworkforce
+│                            sells-the-company site). Deliberately independent
+│                            of every other app: no @nexa/* package dependency,
+│                            no database, no auth. Shares this monorepo's
+│                            tooling only — not the platform's code or data.
 ├── packages/
 │   ├── database/            Prisma schema, migrations, RLS SQL, seed, tenant-context wrapper
 │   ├── config/               Fail-fast environment validation (zod)
