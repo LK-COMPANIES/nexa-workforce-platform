@@ -46,7 +46,8 @@ async def test_call_structured_returns_validated_output(monkeypatch):
         usage=SimpleNamespace(input_tokens=10, output_tokens=20),
     )
     monkeypatch.setattr(
-        "app.orchestration.client.AsyncAnthropic", lambda api_key: _FakeAnthropicClient(response=fake_response)
+        "app.orchestration.client.AsyncAnthropic",
+        lambda api_key: _FakeAnthropicClient(response=fake_response),
     )
 
     result = await call_structured(
@@ -66,24 +67,32 @@ async def test_call_structured_raises_on_schema_mismatch(monkeypatch):
         usage=SimpleNamespace(input_tokens=1, output_tokens=1),
     )
     monkeypatch.setattr(
-        "app.orchestration.client.AsyncAnthropic", lambda api_key: _FakeAnthropicClient(response=fake_response)
+        "app.orchestration.client.AsyncAnthropic",
+        lambda api_key: _FakeAnthropicClient(response=fake_response),
     )
 
     with pytest.raises(StructuredCallError):
         await call_structured(
-            model="claude-sonnet-5", system_prompt="sys", user_prompt="user", output_schema=ContractAuditResult
+            model="claude-sonnet-5",
+            system_prompt="sys",
+            user_prompt="user",
+            output_schema=ContractAuditResult,
         )
 
 
 async def test_call_structured_raises_when_no_tool_use_block(monkeypatch):
     fake_response = SimpleNamespace(content=[], usage=SimpleNamespace(input_tokens=1, output_tokens=1))
     monkeypatch.setattr(
-        "app.orchestration.client.AsyncAnthropic", lambda api_key: _FakeAnthropicClient(response=fake_response)
+        "app.orchestration.client.AsyncAnthropic",
+        lambda api_key: _FakeAnthropicClient(response=fake_response),
     )
 
     with pytest.raises(StructuredCallError, match="tool_use"):
         await call_structured(
-            model="claude-sonnet-5", system_prompt="sys", user_prompt="user", output_schema=ContractAuditResult
+            model="claude-sonnet-5",
+            system_prompt="sys",
+            user_prompt="user",
+            output_schema=ContractAuditResult,
         )
 
 
@@ -99,5 +108,8 @@ async def test_call_structured_raises_on_provider_timeout(monkeypatch):
 
     with pytest.raises(StructuredCallError, match="timeout"):
         await call_structured(
-            model="claude-sonnet-5", system_prompt="sys", user_prompt="user", output_schema=ContractAuditResult
+            model="claude-sonnet-5",
+            system_prompt="sys",
+            user_prompt="user",
+            output_schema=ContractAuditResult,
         )

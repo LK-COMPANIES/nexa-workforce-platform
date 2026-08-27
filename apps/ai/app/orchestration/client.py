@@ -73,7 +73,9 @@ async def call_structured(
 
     latency_ms = int((time.monotonic() - started_at) * 1000)
 
-    tool_use_block = next((block for block in response.content if getattr(block, "type", None) == "tool_use"), None)
+    tool_use_block = next(
+        (block for block in response.content if getattr(block, "type", None) == "tool_use"), None
+    )
     if tool_use_block is None:
         raise StructuredCallError("Model did not return a tool_use block")
 

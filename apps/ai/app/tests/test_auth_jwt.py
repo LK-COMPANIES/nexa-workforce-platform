@@ -62,6 +62,9 @@ def test_verify_caller_rejects_refresh_token_type():
 
 def test_verify_caller_rejects_expired_token():
     settings = get_settings()
+    # iss/aud are payload claims for pyjwt.encode(), not keyword arguments
+    # (only decode() takes issuer=/audience= — see conftest.py's
+    # make_access_token comment, fixed after actually running this suite).
     token = pyjwt.encode(
         {
             "sub": DEFAULT_USER_ID,
@@ -69,12 +72,12 @@ def test_verify_caller_rejects_expired_token():
             "session_id": DEFAULT_SESSION_ID,
             "role_key": "client_admin",
             "token_type": "access",
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
             "exp": int(time.time()) - 60,
         },
         settings.jwt_access_secret,
         algorithm="HS256",
-        issuer=settings.jwt_issuer,
-        audience=settings.jwt_audience,
     )
     with pytest.raises(HTTPException) as exc_info:
         verify_caller(authorization=f"Bearer {token}")
@@ -86,11 +89,16 @@ def test_verify_caller_rejects_token_missing_required_claim():
     # No organization_id claim at all — CallerClaims(**payload) must fail
     # pydantic validation rather than default organization_id to something.
     token = pyjwt.encode(
-        {"sub": DEFAULT_USER_ID, "session_id": DEFAULT_SESSION_ID, "role_key": "x", "token_type": "access"},
+        {
+            "sub": DEFAULT_USER_ID,
+            "session_id": DEFAULT_SESSION_ID,
+            "role_key": "x",
+            "token_type": "access",
+            "iss": settings.jwt_issuer,
+            "aud": settings.jwt_audience,
+        },
         settings.jwt_access_secret,
         algorithm="HS256",
-        issuer=settings.jwt_issuer,
-        audience=settings.jwt_audience,
     )
     with pytest.raises(HTTPException) as exc_info:
         verify_caller(authorization=f"Bearer {token}")

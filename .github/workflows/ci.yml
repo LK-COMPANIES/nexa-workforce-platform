@@ -43,7 +43,15 @@ jobs:
           node-version: ${{ env.NODE_VERSION }}
           cache: npm
       - run: npm ci
+      # `next lint` loads next.config.mjs, which calls loadWebEnv() at
+      # module-load time (Phase 4 design: fail fast on missing config,
+      # even for tooling, not just `next build`/`next dev`) — confirmed
+      # by actually running this job and watching it fail without these,
+      # not assumed.
       - run: npx turbo run lint
+        env:
+          NEXT_PUBLIC_API_URL: http://localhost:4000
+          API_INTERNAL_URL: http://localhost:4000
 
   typecheck:
     name: Type check (turbo run typecheck)

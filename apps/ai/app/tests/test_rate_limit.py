@@ -1,11 +1,11 @@
 import pytest
 from fastapi import HTTPException
 
+from app.auth.jwt import verify_caller
 from app.config import get_settings
 from app.middleware.rate_limit import enforce_rate_limit
 
 from .conftest import ORG_A, ORG_B, make_access_token
-from app.auth.jwt import verify_caller
 
 
 class _FakeRedis:

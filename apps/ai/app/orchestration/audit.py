@@ -77,4 +77,6 @@ async def finalize_failure(
         latency_ms=latency_ms,
         requires_human_review=False,
     )
-    await ai_job_repository.mark_failed(connection, job_id, error_summary=error_summary, audit_log_id=audit_log_id)
+    await ai_job_repository.mark_failed(
+        connection, job_id, error_summary=error_summary, audit_log_id=audit_log_id
+    )

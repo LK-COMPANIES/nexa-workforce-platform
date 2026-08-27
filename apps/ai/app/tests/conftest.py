@@ -59,19 +59,22 @@ def make_access_token(
     extra_claims: dict | None = None,
 ) -> str:
     settings = get_settings()
+    # Unlike jwt.decode() (which validates iss/aud via keyword arguments —
+    # see app/auth/jwt.py's verify_caller), PyJWT's encode() has no
+    # issuer=/audience= parameters at all: iss/aud are just ordinary
+    # payload claims. Confirmed by actually running this suite — an
+    # earlier version of this helper passed them as encode() kwargs, which
+    # raises TypeError immediately in real PyJWT (2.13.0), not something
+    # unit-testable without a real interpreter available.
     claims = {
         "sub": user_id,
         "organization_id": organization_id,
         "session_id": session_id,
         "role_key": role_key,
         "token_type": token_type,
+        "iss": issuer or settings.jwt_issuer,
+        "aud": audience or settings.jwt_audience,
     }
     if extra_claims:
         claims.update(extra_claims)
-    return pyjwt.encode(
-        claims,
-        secret or settings.jwt_access_secret,
-        algorithm="HS256",
-        issuer=issuer or settings.jwt_issuer,
-        audience=audience or settings.jwt_audience,
-    )
+    return pyjwt.encode(claims, secret or settings.jwt_access_secret, algorithm="HS256")

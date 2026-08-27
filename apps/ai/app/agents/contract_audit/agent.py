@@ -65,7 +65,9 @@ async def execute_job(*, job_id: str, organization_id: str, user_id: str, contra
             )
             return
 
-        latest_evaluation = await contract_repository.get_latest_compliance_evaluation(connection, contract_id)
+        latest_evaluation = await contract_repository.get_latest_compliance_evaluation(
+            connection, contract_id
+        )
         user_prompt = build_user_prompt(contract, latest_evaluation)
 
     input_text = SYSTEM_PROMPT + user_prompt

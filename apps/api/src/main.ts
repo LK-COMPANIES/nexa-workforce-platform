@@ -4,9 +4,16 @@ import { NestFactory } from "@nestjs/core";
 import { AppModule } from "./app.module";
 import { AllExceptionsFilter } from "./common/all-exceptions.filter";
 import { ApiConfigService } from "./config/config.service";
+import { StructuredLoggerService } from "./observability/structured-logger.service";
 
 async function bootstrap(): Promise<void> {
-  const app = await NestFactory.create(AppModule);
+  // bufferLogs holds Nest's own bootstrap-time log lines (module init,
+  // route mapping, etc.) until useLogger() below attaches the real logger,
+  // instead of letting them print via Nest's default unstructured console
+  // logger first.
+  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  app.useLogger(app.get(StructuredLoggerService));
+
   const config = app.get(ApiConfigService);
 
   app.use(helmet());
@@ -23,8 +30,7 @@ async function bootstrap(): Promise<void> {
   app.enableShutdownHooks();
 
   await app.listen(config.env.API_PORT);
-  // eslint-disable-next-line no-console
-  console.log(`Nexa API listening on port ${config.env.API_PORT}`);
+  app.get(StructuredLoggerService).log(`Nexa API listening on port ${config.env.API_PORT}`, "Bootstrap");
 }
 
 bootstrap();

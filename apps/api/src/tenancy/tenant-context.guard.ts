@@ -4,6 +4,7 @@ import type { Prisma } from "@prisma/client";
 import type { Request } from "express";
 import { AuthAuditService } from "../auth/auth-audit.service";
 import { extractRequestMetadata } from "../common/request-metadata.util";
+import { annotateRequestContext } from "../observability/request-context";
 import { PrismaService } from "../prisma/prisma.service";
 import type { RequestTenantContext } from "./types";
 
@@ -64,6 +65,11 @@ export class TenantContextGuard implements CanActivate {
         permissions: resolved.permissions,
         isSuperAdminSession: resolved.isSuperAdminSession,
       };
+      // Every log line for the rest of this request — including from
+      // deep inside a service that has no idea a request is even in
+      // flight — now carries which tenant/user it belongs to, without
+      // threading it through every function signature.
+      annotateRequestContext({ organizationId: claims.organizationId, userId: claims.userId });
       return true;
     } catch (error) {
       const reason = error instanceof SessionRejectedError ? error.reason : "TENANT_ACCESS_DENIED";

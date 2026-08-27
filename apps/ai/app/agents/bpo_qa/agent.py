@@ -19,7 +19,12 @@ REQUEST_TYPE = "bpo_interaction_qa_review"
 
 
 async def create_job(
-    *, organization_id: str, user_id: str, contract_id: str, interaction_transcript: str, qa_criteria: Optional[list[str]]
+    *,
+    organization_id: str,
+    user_id: str,
+    contract_id: str,
+    interaction_transcript: str,
+    qa_criteria: Optional[list[str]],
 ) -> dict:
     async with tenant_transaction(organization_id, user_id) as connection:
         contract = await contract_repository.get_contract(connection, contract_id)

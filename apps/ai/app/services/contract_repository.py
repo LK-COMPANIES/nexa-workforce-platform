@@ -42,7 +42,9 @@ async def get_contract(connection: asyncpg.Connection, contract_id: str) -> Opti
     return dict(row) if row else None
 
 
-async def get_latest_compliance_evaluation(connection: asyncpg.Connection, contract_id: str) -> Optional[dict]:
+async def get_latest_compliance_evaluation(
+    connection: asyncpg.Connection, contract_id: str
+) -> Optional[dict]:
     """Latest deterministic Phase 3 compliance result for this contract, for
     the contract audit agent to reference (never override) in its prompt."""
     row = await connection.fetchrow(

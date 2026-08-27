@@ -7,7 +7,9 @@ from ...schemas.contract_audit import ContractAuditRequest
 from ...schemas.jobs import JobAccepted
 from . import agent
 
-router = APIRouter(prefix="/agents/contract-audit", tags=["contract-audit"], dependencies=[Depends(enforce_max_body_size)])
+router = APIRouter(
+    prefix="/agents/contract-audit", tags=["contract-audit"], dependencies=[Depends(enforce_max_body_size)]
+)
 
 
 @router.post("", response_model=JobAccepted, status_code=status.HTTP_202_ACCEPTED)

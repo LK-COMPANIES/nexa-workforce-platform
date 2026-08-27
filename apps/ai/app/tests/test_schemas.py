@@ -7,7 +7,9 @@ from app.schemas.contract_audit import ContractAuditFinding, ContractAuditResult
 
 def test_contract_audit_finding_rejects_invalid_severity():
     with pytest.raises(ValidationError):
-        ContractAuditFinding(category="termination_clause", severity="ERROR", observation="o", recommendation="r")
+        ContractAuditFinding(
+            category="termination_clause", severity="ERROR", observation="o", recommendation="r"
+        )
 
 
 def test_contract_audit_result_accepts_valid_payload_and_defaults_disclaimer():
@@ -51,5 +53,7 @@ def test_bpo_qa_finding_rejects_invalid_rating():
 
 
 def test_bpo_qa_finding_accepts_valid_rating_without_suggestion():
-    finding = BpoQaFinding(criterion="Professionalism", rating="MEETS", evidence="Agent was courteous throughout.")
+    finding = BpoQaFinding(
+        criterion="Professionalism", rating="MEETS", evidence="Agent was courteous throughout."
+    )
     assert finding.suggestion is None
