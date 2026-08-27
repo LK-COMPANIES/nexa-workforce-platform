@@ -113,10 +113,16 @@ jobs:
         options: >-
           --health-cmd="pg_isready -U nexa_owner -d nexa_workforce_ci"
           --health-interval=5s --health-timeout=5s --health-retries=10
+    # GitHub Actions does not allow an env: block to reference the `env`
+    # context to compose a sibling value (only workflow-level env is
+    # reachable from `services.<id>.env`, which is why that block above
+    # works but this one can't do `${{ env.CI_POSTGRES_USER }}` etc.) — so
+    # these are the same disposable CI-only literals from the workflow-
+    # level env block above, spelled out directly rather than composed.
     env:
-      DIRECT_DATABASE_URL: postgresql://${{ env.CI_POSTGRES_USER }}:${{ env.CI_POSTGRES_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
-      DATABASE_URL: postgresql://nexa_app:${{ env.CI_NEXA_APP_DB_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
-      NEXA_APP_DB_PASSWORD: ${{ env.CI_NEXA_APP_DB_PASSWORD }}
+      DIRECT_DATABASE_URL: postgresql://nexa_owner:ci_owner_password@localhost:5432/nexa_workforce_ci?schema=public
+      DATABASE_URL: postgresql://nexa_app:ci_app_password@localhost:5432/nexa_workforce_ci?schema=public
+      NEXA_APP_DB_PASSWORD: ci_app_password
       CI: "true" # makes the integration scripts FAIL (not skip) if Postgres is unreachable — see test/_helpers.ts
     steps:
       - uses: actions/checkout@v4
@@ -163,10 +169,12 @@ jobs:
         ports: ["6379:6379"]
         options: >-
           --health-cmd="redis-cli ping" --health-interval=5s --health-timeout=5s --health-retries=10
+    # Same restriction as database-rls-tests above — literals, not a
+    # composed reference to the workflow-level env block.
     env:
-      DIRECT_DATABASE_URL: postgresql://${{ env.CI_POSTGRES_USER }}:${{ env.CI_POSTGRES_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
-      DATABASE_URL: postgresql://nexa_app:${{ env.CI_NEXA_APP_DB_PASSWORD }}@localhost:5432/${{ env.CI_POSTGRES_DB }}?schema=public
-      NEXA_APP_DB_PASSWORD: ${{ env.CI_NEXA_APP_DB_PASSWORD }}
+      DIRECT_DATABASE_URL: postgresql://nexa_owner:ci_owner_password@localhost:5432/nexa_workforce_ci?schema=public
+      DATABASE_URL: postgresql://nexa_app:ci_app_password@localhost:5432/nexa_workforce_ci?schema=public
+      NEXA_APP_DB_PASSWORD: ci_app_password
       REDIS_URL: redis://localhost:6379
       JWT_ACCESS_SECRET: ci-test-only-access-secret-at-least-32-characters-long
       JWT_ACCESS_TTL: 15m
